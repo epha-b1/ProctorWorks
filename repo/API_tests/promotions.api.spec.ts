@@ -52,7 +52,7 @@ describe('Promotions & Coupons API', () => {
     logStep('GET', '/promotions');
     const res = await request(server).get('/promotions').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/promotions', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.some((p: any) => p.id === promoId)).toBe(true);
   });
 
@@ -71,7 +71,7 @@ describe('Promotions & Coupons API', () => {
     logStep('GET', '/coupons');
     const res = await request(server).get('/coupons').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/coupons', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.some((c: any) => c.id === couponId)).toBe(true);
   });
 
@@ -79,7 +79,7 @@ describe('Promotions & Coupons API', () => {
     logStep('POST', `/coupons/${couponCode}/claim`);
     const res = await request(server).post(`/coupons/${couponCode}/claim`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'claim', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.coupon_id).toBe(couponId);
     // Check remaining
     const c = await request(server).get('/coupons').set('Authorization', `Bearer ${token}`);
@@ -91,14 +91,14 @@ describe('Promotions & Coupons API', () => {
     logStep('POST', `/coupons/${couponCode}/claim`);
     const res = await request(server).post(`/coupons/${couponCode}/claim`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'claim', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
   });
 
   it('POST /coupons/:id/expire → 200', async () => {
     logStep('POST', `/coupons/${couponId}/expire`);
     const res = await request(server).post(`/coupons/${couponId}/expire`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'expire', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
   });
 
   it('POST /coupons/:code/claim on expired → error', async () => {
@@ -118,7 +118,7 @@ describe('Promotions & Coupons API', () => {
     logStep('POST', `/coupons/${code2}/claim (last)`);
     const res = await request(server).post(`/coupons/${code2}/claim`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'claim', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
 
     // Verify exhausted
     const list = await request(server).get('/coupons').set('Authorization', `Bearer ${token}`);

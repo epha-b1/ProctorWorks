@@ -3,7 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { AuditLog } from './entities/audit-log.entity';
 
-const SENSITIVE_KEYS = ['password', 'hash', 'secret', 'token', 'encrypted'];
+const SENSITIVE_KEYS = ['password', 'hash', 'secret', 'token', 'encrypted', 'notes', 'key'];
 
 function maskSensitiveFields(
   detail: Record<string, any> | null,

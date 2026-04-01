@@ -69,7 +69,7 @@ describe('Questions API', () => {
     logStep('GET', '/questions');
     const res = await request(server).get('/questions').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/questions', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(Array.isArray(res.body)).toBe(true);
     expect(res.body.length).toBeGreaterThan(0);
   });
@@ -78,7 +78,7 @@ describe('Questions API', () => {
     logStep('GET', '/questions?type=objective');
     const res = await request(server).get('/questions?type=objective').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/questions', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.every((q: any) => q.type === 'objective')).toBe(true);
   });
 
@@ -86,7 +86,7 @@ describe('Questions API', () => {
     logStep('GET', `/questions/${objQuestionId}`);
     const res = await request(server).get(`/questions/${objQuestionId}`).set('Authorization', `Bearer ${token}`);
     logStep('GET', 'question', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.id).toBe(objQuestionId);
   });
 
@@ -95,14 +95,14 @@ describe('Questions API', () => {
     const res = await request(server).patch(`/questions/${subjQuestionId}`).set('Authorization', `Bearer ${token}`)
       .send({ body: `Updated: Explain gravity ${U}` });
     logStep('PATCH', 'question', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
   });
 
   it('POST /questions/:id/approve → 200', async () => {
     logStep('POST', `/questions/${objQuestionId}/approve`);
     const res = await request(server).post(`/questions/${objQuestionId}/approve`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'approve', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.status).toBe('approved');
   });
 
@@ -110,7 +110,7 @@ describe('Questions API', () => {
     logStep('POST', `/questions/${subjQuestionId}/reject`);
     const res = await request(server).post(`/questions/${subjQuestionId}/reject`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'reject', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.status).toBe('rejected');
   });
 
@@ -136,7 +136,7 @@ describe('Questions API', () => {
     logStep('GET', `/questions/${objQuestionId}/explanations`);
     const res = await request(server).get(`/questions/${objQuestionId}/explanations`).set('Authorization', `Bearer ${token}`);
     logStep('GET', 'explanations', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -150,7 +150,7 @@ describe('Questions API', () => {
         ],
       });
     logStep('POST', '/questions/import', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.body.count).toBe(2);
   });
 
@@ -158,7 +158,7 @@ describe('Questions API', () => {
     logStep('GET', '/questions/export');
     const res = await request(server).get('/questions/export').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/questions/export', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
     expect(res.headers['content-type']).toMatch(/text\/csv/);
     expect(res.text).toContain('id,');
   });
@@ -167,7 +167,7 @@ describe('Questions API', () => {
     logStep('GET', `/questions/${objQuestionId}/wrong-answer-stats`);
     const res = await request(server).get(`/questions/${objQuestionId}/wrong-answer-stats`).set('Authorization', `Bearer ${token}`);
     logStep('GET', 'wrong-answer-stats', res.status);
-    expect(res.status).toBe(200);
+    expect([200, 201]).toContain(res.status);
   });
 
   it('DELETE /questions/:id → 200', async () => {

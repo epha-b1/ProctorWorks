@@ -6,13 +6,14 @@ import { IdempotencyKey } from './entities/idempotency-key.entity';
 import { Sku } from '../products/entities/sku.entity';
 import { OrdersService } from './orders.service';
 import { OrdersController } from './orders.controller';
+import { EncryptionService } from '../common/encryption.service';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Order, OrderItem, IdempotencyKey, Sku]),
   ],
   controllers: [OrdersController],
-  providers: [OrdersService],
+  providers: [OrdersService, EncryptionService],
   exports: [TypeOrmModule, OrdersService],
 })
 export class OrdersModule {}

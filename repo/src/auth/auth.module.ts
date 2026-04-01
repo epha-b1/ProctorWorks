@@ -13,6 +13,7 @@ import { RolesGuard } from '../common/guards/roles.guard';
 import { User } from './entities/user.entity';
 import { Store } from './entities/store.entity';
 import { AuditModule } from '../audit/audit.module';
+import { EncryptionService } from '../common/encryption.service';
 
 @Module({
   imports: [
@@ -33,6 +34,7 @@ import { AuditModule } from '../audit/audit.module';
   controllers: [AuthController, UsersController, StoresController],
   providers: [
     AuthService,
+    EncryptionService,
     JwtStrategy,
     {
       provide: APP_GUARD,

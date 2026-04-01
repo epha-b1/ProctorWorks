@@ -566,6 +566,36 @@ export class InitialSchema1711900000000 implements MigrationInterface {
     await queryRunner.query(`CREATE INDEX IF NOT EXISTS "IDX_audit_logs_created_at" ON "audit_logs" ("created_at")`);
     await queryRunner.query(`CREATE INDEX IF NOT EXISTS "IDX_audit_logs_action" ON "audit_logs" ("action")`);
 
+    // Audit log: append-only — prevent DELETE and UPDATE via trigger
+    await queryRunner.query(`
+      CREATE OR REPLACE FUNCTION prevent_audit_log_modification()
+      RETURNS TRIGGER AS $$
+      BEGIN
+        RAISE EXCEPTION 'Audit logs are immutable. DELETE and UPDATE operations are not allowed.';
+        RETURN NULL;
+      END;
+      $$ LANGUAGE plpgsql;
+    `);
+
+    await queryRunner.query(`
+      DROP TRIGGER IF EXISTS trg_audit_logs_no_delete ON "audit_logs";
+      CREATE TRIGGER trg_audit_logs_no_delete
+        BEFORE DELETE ON "audit_logs"
+        FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_modification();
+    `);
+
+    await queryRunner.query(`
+      DROP TRIGGER IF EXISTS trg_audit_logs_no_update ON "audit_logs";
+      CREATE TRIGGER trg_audit_logs_no_update
+        BEFORE UPDATE ON "audit_logs"
+        FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_modification();
+    `);
+
+    // Audit log: 7-year retention — add comment for policy documentation
+    await queryRunner.query(`
+      COMMENT ON TABLE "audit_logs" IS 'Immutable audit trail. 7-year retention policy. DELETE and UPDATE blocked by trigger.';
+    `);
+
     // Seed a default platform admin user (password: admin123)
     // bcrypt hash for 'admin123' with 12 rounds
     await queryRunner.query(`

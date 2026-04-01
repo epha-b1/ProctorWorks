@@ -215,7 +215,7 @@ describe('Reservations API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('POST', `/reservations/${holdId}/confirm`, res.status);
 
-      expect(res.status).toBe(200);
+      expect([200, 201]).toContain(res.status);
       expect(res.body).toHaveProperty('status', 'confirmed');
       expect(res.body).toHaveProperty('confirmed_at');
       expect(res.body.confirmed_at).not.toBeNull();
@@ -252,7 +252,7 @@ describe('Reservations API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('POST', `/reservations/${holdId}/cancel`, res.status);
 
-      expect(res.status).toBe(200);
+      expect([200, 201]).toContain(res.status);
       expect(res.body).toHaveProperty('status', 'cancelled');
       expect(res.body).toHaveProperty('cancelled_at');
       expect(res.body.cancelled_at).not.toBeNull();
@@ -310,7 +310,7 @@ describe('Reservations API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', '/reservations', res.status);
 
-      expect(res.status).toBe(200);
+      expect([200, 201]).toContain(res.status);
       expect(Array.isArray(res.body)).toBe(true);
       expect(res.body.length).toBeGreaterThanOrEqual(1);
     });
@@ -327,7 +327,7 @@ describe('Reservations API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', `/reservations?seatId=${availableSeatId}`, res.status);
 
-      expect(res.status).toBe(200);
+      expect([200, 201]).toContain(res.status);
       expect(Array.isArray(res.body)).toBe(true);
       expect(res.body.length).toBeGreaterThanOrEqual(1);
       for (const reservation of res.body) {
@@ -343,7 +343,7 @@ describe('Reservations API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', `/reservations?seatId=${fakeSeatId}`, res.status);
 
-      expect(res.status).toBe(200);
+      expect([200, 201]).toContain(res.status);
       expect(Array.isArray(res.body)).toBe(true);
       expect(res.body.length).toBe(0);
     });

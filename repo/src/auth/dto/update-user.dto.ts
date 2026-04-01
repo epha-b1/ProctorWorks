@@ -1,4 +1,4 @@
-import { IsOptional, IsEnum, IsUUID } from 'class-validator';
+import { IsOptional, IsEnum, IsUUID, IsString } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { UserRole, UserStatus } from '../entities/user.entity';
 
@@ -17,4 +17,9 @@ export class UpdateUserDto {
   @IsOptional()
   @IsUUID()
   storeId?: string;
+
+  @ApiPropertyOptional({ description: 'Sensitive notes (will be encrypted at rest)' })
+  @IsOptional()
+  @IsString()
+  notes?: string;
 }

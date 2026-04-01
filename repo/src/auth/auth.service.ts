@@ -13,6 +13,7 @@ import * as bcrypt from 'bcrypt';
 import { User, UserStatus } from './entities/user.entity';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
+import { EncryptionService } from '../common/encryption.service';
 
 @Injectable()
 export class AuthService {
@@ -23,6 +24,7 @@ export class AuthService {
     private readonly userRepository: Repository<User>,
     private readonly jwtService: JwtService,
     private readonly configService: ConfigService,
+    private readonly encryptionService: EncryptionService,
   ) {
     this.bcryptRounds = this.configService.get<number>('bcrypt.rounds', 12);
   }
@@ -139,6 +141,9 @@ export class AuthService {
     if (dto.storeId !== undefined) {
       user.store_id = dto.storeId;
     }
+    if (dto.notes !== undefined) {
+      user.notes = dto.notes ? this.encryptionService.encrypt(dto.notes) : null;
+    }
 
     const saved = await this.userRepository.save(user);
     delete (saved as any).password_hash;
@@ -196,7 +201,18 @@ export class AuthService {
     if (!user) {
       throw new NotFoundException('User not found');
     }
+    // Decrypt notes if encrypted
+    if (user.notes && this.encryptionService.isEncrypted(user.notes)) {
+      user.notes = this.encryptionService.decrypt(user.notes);
+    }
     return user;
+  }
+
+  async updateNotes(id: string, notes: string): Promise<User> {
+    const user = await this.userRepository.findOne({ where: { id } });
+    if (!user) throw new NotFoundException('User not found');
+    user.notes = this.encryptionService.encrypt(notes);
+    return this.userRepository.save(user);
   }
 
   async changePassword(

@@ -1,16 +1,19 @@
 import {
   Injectable,
+  Logger,
   NotFoundException,
   ConflictException,
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource } from 'typeorm';
+import { Repository, DataSource, LessThan } from 'typeorm';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { Order, OrderStatus } from './entities/order.entity';
 import { OrderItem } from './entities/order-item.entity';
 import { IdempotencyKey } from './entities/idempotency-key.entity';
 import { Sku } from '../products/entities/sku.entity';
 import { CreateOrderDto } from './dto/create-order.dto';
+import { EncryptionService } from '../common/encryption.service';
 
 @Injectable()
 export class OrdersService {
@@ -24,6 +27,7 @@ export class OrdersService {
     @InjectRepository(Sku)
     private readonly skuRepo: Repository<Sku>,
     private readonly dataSource: DataSource,
+    private readonly encryptionService: EncryptionService,
   ) {}
 
   private enforceStoreScope(user: any): string | null {
@@ -189,6 +193,24 @@ export class OrdersService {
       relations: ['items'],
     });
     if (!order) throw new NotFoundException(`Order ${id} not found`);
+    // Decrypt internal_notes if encrypted
+    if (order.internal_notes && this.encryptionService.isEncrypted(order.internal_notes)) {
+      order.internal_notes = this.encryptionService.decrypt(order.internal_notes);
+    }
     return order;
+  }
+
+  // Cleanup idempotency keys older than 24 hours
+  private readonly logger = new Logger(OrdersService.name);
+
+  @Cron(CronExpression.EVERY_HOUR)
+  async cleanupExpiredIdempotencyKeys(): Promise<void> {
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const result = await this.idempotencyRepo.delete({
+      created_at: LessThan(cutoff),
+    });
+    if (result.affected > 0) {
+      this.logger.log(`Cleaned up ${result.affected} expired idempotency keys`);
+    }
   }
 }

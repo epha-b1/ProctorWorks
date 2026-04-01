@@ -5,13 +5,16 @@
   "main": "dist/main.js",
   "scripts": {
     "build": "npx tsc",
-    "start": "node dist/main",
+    "start": "node dist/src/main",
     "start:dev": "npx ts-node src/main.ts",
     "test": "jest --verbose",
     "test:unit": "jest --testPathPatterns=unit_tests --verbose",
     "test:api": "jest --testPathPatterns=API_tests --verbose --runInBand",
     "test:all": "jest --testPathPatterns='unit_tests|API_tests' --verbose --runInBand",
-    "typeorm": "npx ts-node -r tsconfig-paths/register ./node_modules/typeorm/cli.js"
+    "test:cov": "jest --testPathPatterns='unit_tests|API_tests' --verbose --runInBand --coverage",
+    "migration:run": "npx ts-node ./node_modules/typeorm/cli.js migration:run -d src/database/typeorm.config.ts",
+    "migration:revert": "npx ts-node ./node_modules/typeorm/cli.js migration:revert -d src/database/typeorm.config.ts",
+    "migration:generate": "npx ts-node ./node_modules/typeorm/cli.js migration:generate -d src/database/typeorm.config.ts"
   },
   "keywords": [],
   "author": "",
