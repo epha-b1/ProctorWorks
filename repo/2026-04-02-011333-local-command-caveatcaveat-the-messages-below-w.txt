@@ -1059,7 +1059,7 @@ add also
 
   Would you like me to proceed testing the remaining slices one by one, or do
   you want to try something specific first?
-✻ Brewed for 30m 8s
+✻ Crunched for 30m 8s
 
 ● Background command "Install NestJS and all dependencies" completed (exit code
 0)
@@ -1653,7 +1653,7 @@ add also
   The remaining work (Slice 13) is writing the unit tests and API tests. Want me
    to proceed with that now?
 
-✻ Worked for 10m 33s
+✻ Cogitated for 10m 33s
 
 ❯ continue to slice 13 please and cover every api and every unit to make the    
 test coverge hight                                                              
@@ -2421,7 +2421,7 @@ Open http://localhost:3000/api/docs — Swagger UI must load
 ● Background command "Build and start Docker" completed (exit code 0)
   ⎿  API Error: Unable to connect to API (ConnectionRefused)
 
-✻ Brewed for 2m 58s
+✻ Worked for 2m 58s
 
 ❯ Improve the ProctorWorks (NestJS) project's Docker and testing setup to match 
  professional standards. Currently, users must manually run docker compose up   
@@ -3015,7 +3015,7 @@ Current tech stack: NestJS + TypeORM + PostgreSQL + Jest + Docker
   │ .gitignore          │ Covers node_modules/, dist/, .env, coverage/      │
   └─────────────────────┴───────────────────────────────────────────────────┘
 
-✻ Worked for 21m 17s
+✻ Cogitated for 21m 17s
 
 ❯ The project tests are passing but several critical features are missing that  
 will cause AI self-test failure. Here's what needs to be implemented:           
@@ -5227,7 +5227,7 @@ Update the audit markdown with revised judgments and evidence.
 
   None blocking. All audit items upgraded.
 
-✻ Worked for 28m 6s
+✻ Churned for 28m 6s
 
 ❯ Reservations isolation still has a likely leak bug: controller uses user.sub  
 in reservations.controller.ts:48-51, but JWT validate returns id/storeId (not   
@@ -5271,7 +5271,7 @@ Want me to patch that final gap now and re-run the targeted tests immediately?
 ● All 48 tests across reservations + security suites pass, no failures. The
   user.id now correctly scopes non-admin reservation queries.
 
-✻ Sautéed for 1m 46s
+✻ Worked for 1m 46s
 
 ❯ Minor Issues Found:                                                           
 Default JWT Secret: Development secret used by default (medium priority)        
@@ -5721,4 +5721,8 @@ Test Coverage Gaps: Some security scenarios and edge cases not fully covered
 
   Final: 96 unit + 135 API = 231 tests, 0 failures.
 
-✻ Sautéed for 5m 44s
+✻ Cogitated for 5m 44s
+
+❯ /export                                                                       
+  ⎿  Conversation exported to: /home/someone/Documents/eagle-point/104/repo/2026
+     -04-02-003826-local-command-caveatcaveat-the-messages-below-w.txt
