@@ -149,3 +149,53 @@
 **Assumption:** Design target enforced through proper indexing, query optimization, and connection pooling. Not tested with load tests in the submission, but documented in the README with the indexing strategy.
 
 **Solution:** Add database indexes on all foreign keys and frequently queried columns. Use TypeORM query builder for complex queries to avoid N+1. Document index strategy in `docs/design.md`.
+
+---
+
+## 16. Stores CRUD — Does Platform Admin Manage Stores?
+
+**Question:** The data model has a `stores` table and store_admin is scoped to a store, but the API spec doesn't define explicit store CRUD endpoints. Should Platform Admin be able to create/list/update/delete stores?
+
+**Assumption:** Yes — Platform Admin needs basic CRUD for stores so that store_admin users can be assigned to them. Endpoints: `GET /stores`, `POST /stores`, `PATCH /stores/:id`, `DELETE /stores/:id` (Platform Admin only).
+
+**Solution:** Add a `stores` module with basic CRUD, protected by Platform Admin role.
+
+---
+
+## 17. Seat Status Transitions — Free or Restricted?
+
+**Question:** Can seats transition between any statuses (available, disabled, maintenance) freely, or are there restricted state transitions?
+
+**Assumption:** Free transitions — a `PATCH /seats/:id` with `{status: "maintenance"}` is allowed from any current status. The only enforcement is that a seat in maintenance cannot have active holds.
+
+**Solution:** PATCH endpoint allows any valid status value. If transitioning to maintenance, any active holds on the seat should be expired.
+
+---
+
+## 18. Order Fulfill Endpoint — Missing from API Spec
+
+**Question:** The self-test checklist (Section 5) lists `POST /orders/:id/fulfill` but it's not in the API spec YAML. Should it exist?
+
+**Assumption:** Yes — the state machine is pending → confirmed → fulfilled → cancelled, so a fulfill endpoint is required. `POST /orders/:id/fulfill` transitions from confirmed to fulfilled.
+
+**Solution:** Add the endpoint to the orders controller alongside confirm and cancel.
+
+---
+
+## 19. Coupon Distribute — What Does It Mean?
+
+**Question:** The prompt mentions "distribute" as a coupon operation alongside claim, redeem, and expire. The API spec has a claim endpoint but not distribute. What is distribute?
+
+**Assumption:** Distribute = admin assigns a coupon to specific users (batch operation). `POST /coupons/:id/distribute` with `{userIds: [...]}` creates coupon_claims records for each user without them needing to claim it themselves.
+
+**Solution:** Add distribute endpoint that creates claims for specified users.
+
+---
+
+## 20. SKU Price Tiers — Endpoint or Nested?
+
+**Question:** The data model has `sku_price_tiers` as a separate table, but there's no explicit endpoint for managing price tiers. Should they have their own CRUD or be managed inline with SKU create/update?
+
+**Assumption:** Managed inline — when creating or updating a SKU, include a `priceTiers` array in the request body. No standalone price tier endpoints.
+
+**Solution:** SKU create/update DTOs accept optional `priceTiers: [{tierName, priceCents}]`. Service handles upsert/delete of tiers within the SKU transaction.

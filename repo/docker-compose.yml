@@ -1,0 +1,31 @@
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgres://proctorworks:proctorworks@db:5432/proctorworks
+      JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-min-32-chars-long}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff}
+      NODE_ENV: development
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_USER: proctorworks
+      POSTGRES_PASSWORD: proctorworks
+      POSTGRES_DB: proctorworks
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proctorworks"]
+      interval: 5s
+      retries: 10
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
