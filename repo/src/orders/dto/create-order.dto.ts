@@ -38,4 +38,9 @@ export class CreateOrderDto {
   @IsString()
   @IsOptional()
   couponCode?: string;
+
+  @ApiPropertyOptional({ description: 'Internal notes (encrypted at rest)' })
+  @IsString()
+  @IsOptional()
+  internalNotes?: string;
 }

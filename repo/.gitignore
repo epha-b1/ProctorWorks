@@ -5,3 +5,4 @@ dist/
 coverage/
 .claude/
 .claude/settings.local.json
+*.tmpl

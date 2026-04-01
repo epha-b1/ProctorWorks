@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Notification } from './entities/notification.entity';
@@ -59,8 +59,17 @@ export class NotificationsService {
     });
   }
 
-  async markAsRead(id: string): Promise<Notification> {
-    await this.notificationRepo.update(id, { read: true });
-    return this.notificationRepo.findOneByOrFail({ id });
+  async markAsRead(id: string, userId: string): Promise<Notification> {
+    const notification = await this.notificationRepo.findOne({
+      where: { id },
+    });
+    if (!notification) {
+      throw new NotFoundException(`Notification ${id} not found`);
+    }
+    if (notification.user_id !== userId) {
+      throw new ForbiddenException('Cannot modify another user\'s notification');
+    }
+    notification.read = true;
+    return this.notificationRepo.save(notification);
   }
 }

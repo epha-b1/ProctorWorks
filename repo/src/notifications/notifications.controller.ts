@@ -52,7 +52,11 @@ export class NotificationsController {
   @ApiOperation({ summary: 'Mark a notification as read' })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Notification marked as read' })
-  markAsRead(@Param('id', ParseUUIDPipe) id: string) {
-    return this.notificationsService.markAsRead(id);
+  @ApiResponse({ status: 403, description: 'Not your notification' })
+  markAsRead(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser('id') userId: string,
+  ) {
+    return this.notificationsService.markAsRead(id, userId);
   }
 }

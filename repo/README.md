@@ -6,7 +6,7 @@ Offline operations platform for managing a catalog-driven practice product busin
 
 NestJS + TypeORM + PostgreSQL. Runs on a single Docker host with no external connectivity.
 
-## Quick Start
+## Quick Start (Docker)
 
 ```bash
 docker compose up --build
@@ -16,19 +16,47 @@ docker compose up --build
 - **Swagger UI**: http://localhost:3000/api/docs
 - **Health check**: http://localhost:3000/health
 
+## Quick Start (Local / No Docker)
+
+Requires Node 20+ and a running PostgreSQL instance.
+
+```bash
+# 1. Set environment
+export DATABASE_URL=postgres://proctorworks:proctorworks@127.0.0.1:5433/proctorworks
+export JWT_SECRET=dev-jwt-secret-min-32-chars-long-x
+export ENCRYPTION_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+
+# 2. Install and build
+npm install --legacy-peer-deps
+npm run build
+
+# 3. Start (ensure DB is running with matching credentials)
+npm start
+
+# 4. Run tests
+npm run test:unit -- --runInBand
+npm run test:api -- --runInBand
+```
+
 ## Default Credentials
 
 | Username | Password     | Role            |
 |----------|-------------|-----------------|
 | admin    | Admin1234!  | platform_admin  |
+| store_admin | Admin1234! | store_admin  |
+| reviewer | Admin1234!  | content_reviewer |
+| auditor  | Admin1234!  | auditor         |
 
 ## Run Tests
 
 ```bash
+# Docker (recommended — fully self-contained)
 ./run_tests.sh
-```
 
-Runs unit tests and API integration tests inside the Docker container.
+# Local
+npm run test:unit -- --runInBand
+npm run test:api -- --runInBand
+```
 
 ## Services
 

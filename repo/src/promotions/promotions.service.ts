@@ -161,6 +161,36 @@ export class PromotionsService {
     return this.couponRepo.find({ where });
   }
 
+  async updatePromotion(
+    id: string,
+    dto: Partial<any>,
+    storeId?: string,
+  ): Promise<Promotion> {
+    const where: any = { id };
+    if (storeId) where.store_id = storeId;
+    const promo = await this.promotionRepo.findOne({ where });
+    if (!promo) throw new NotFoundException('Promotion not found');
+    if (dto.name !== undefined) promo.name = dto.name;
+    if (dto.type !== undefined) promo.type = dto.type;
+    if (dto.priority !== undefined) promo.priority = dto.priority;
+    if (dto.discountType !== undefined) promo.discount_type = dto.discountType;
+    if (dto.discountValue !== undefined) promo.discount_value = dto.discountValue;
+    if (dto.minOrderCents !== undefined) promo.min_order_cents = dto.minOrderCents;
+    if (dto.startsAt !== undefined) promo.starts_at = dto.startsAt ? new Date(dto.startsAt) : null;
+    if (dto.endsAt !== undefined) promo.ends_at = dto.endsAt ? new Date(dto.endsAt) : null;
+    if (dto.redemptionCap !== undefined) promo.redemption_cap = dto.redemptionCap;
+    if (dto.active !== undefined) promo.active = dto.active;
+    return this.promotionRepo.save(promo);
+  }
+
+  async deletePromotion(id: string, storeId?: string): Promise<void> {
+    const where: any = { id };
+    if (storeId) where.store_id = storeId;
+    const promo = await this.promotionRepo.findOne({ where });
+    if (!promo) throw new NotFoundException('Promotion not found');
+    await this.promotionRepo.remove(promo);
+  }
+
   calculateDiscount(promotion: Promotion, orderTotalCents: number): number {
     if (
       promotion.min_order_cents !== null &&

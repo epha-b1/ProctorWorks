@@ -19,6 +19,9 @@ describe('ReservationsService', () => {
   const USER_ID = 'user-uuid-1';
   const RESERVATION_ID = 'res-uuid-1';
 
+  let mockManager: Record<string, jest.Mock>;
+  let dataSource: Record<string, jest.Mock>;
+
   beforeEach(() => {
     reservationRepo = {
       findOne: jest.fn(),
@@ -32,9 +35,26 @@ describe('ReservationsService', () => {
       findOne: jest.fn(),
     };
 
+    // Mock manager used inside dataSource.transaction callback
+    mockManager = {
+      createQueryBuilder: jest.fn().mockReturnValue({
+        setLock: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        getOne: jest.fn(),
+      }),
+      findOne: jest.fn(),
+      create: jest.fn().mockImplementation((_cls, dto) => ({ ...dto })),
+      save: jest.fn().mockImplementation((entity) => Promise.resolve({ id: 'res-uuid-1', ...entity })),
+    };
+
+    dataSource = {
+      transaction: jest.fn().mockImplementation((cb) => cb(mockManager)),
+    };
+
     service = new ReservationsService(
       reservationRepo as any,
       seatRepo as any,
+      dataSource as any,
     );
   });
 
@@ -47,88 +67,59 @@ describe('ReservationsService', () => {
   // ---------------------------------------------------------------
 
   describe('createHold', () => {
+    function setupManagerMocks(seat: any, activeHold: any) {
+      const qb = mockManager.createQueryBuilder();
+      qb.getOne.mockResolvedValue(seat);
+      mockManager.findOne.mockResolvedValue(activeHold);
+    }
+
     it('creates a reservation with holdUntil = now + 15 minutes', async () => {
       const now = new Date('2026-03-31T12:00:00Z');
       jest.spyOn(Date, 'now').mockReturnValue(now.getTime());
-
       const expectedHoldUntil = new Date(now.getTime() + 15 * 60 * 1000);
 
-      seatRepo.findOne.mockResolvedValue({
-        id: SEAT_ID,
-        status: SeatStatus.AVAILABLE,
-      });
-      reservationRepo.findOne.mockResolvedValue(null); // no active hold
-      reservationRepo.create.mockImplementation((dto) => ({ ...dto }));
-      reservationRepo.save.mockImplementation((entity) =>
-        Promise.resolve({ id: RESERVATION_ID, ...entity }),
-      );
+      setupManagerMocks({ id: SEAT_ID, status: SeatStatus.AVAILABLE }, null);
 
       const result = await service.createHold(SEAT_ID, USER_ID);
 
-      expect(seatRepo.findOne).toHaveBeenCalledWith({
-        where: { id: SEAT_ID },
-      });
-      expect(reservationRepo.create).toHaveBeenCalledWith({
-        seat_id: SEAT_ID,
-        user_id: USER_ID,
-        status: ReservationStatus.HOLD,
-        hold_until: expectedHoldUntil,
-      });
-      expect(reservationRepo.save).toHaveBeenCalled();
+      expect(dataSource.transaction).toHaveBeenCalled();
+      expect(mockManager.save).toHaveBeenCalled();
       expect(result.status).toBe(ReservationStatus.HOLD);
       expect(result.hold_until).toEqual(expectedHoldUntil);
     });
 
     it('throws BadRequestException when seat is in maintenance', async () => {
-      seatRepo.findOne.mockResolvedValue({
-        id: SEAT_ID,
-        status: SeatStatus.MAINTENANCE,
-      });
+      setupManagerMocks({ id: SEAT_ID, status: SeatStatus.MAINTENANCE }, null);
 
       await expect(service.createHold(SEAT_ID, USER_ID)).rejects.toThrow(
         BadRequestException,
       );
-      expect(reservationRepo.create).not.toHaveBeenCalled();
+      expect(mockManager.save).not.toHaveBeenCalled();
     });
 
     it('throws ConflictException when an active hold already exists', async () => {
-      seatRepo.findOne.mockResolvedValue({
-        id: SEAT_ID,
-        status: SeatStatus.AVAILABLE,
-      });
-      reservationRepo.findOne.mockResolvedValue({
-        id: 'existing-hold',
-        seat_id: SEAT_ID,
-        status: ReservationStatus.HOLD,
-        hold_until: new Date(Date.now() + 10 * 60 * 1000),
-      });
+      setupManagerMocks(
+        { id: SEAT_ID, status: SeatStatus.AVAILABLE },
+        { id: 'existing-hold', seat_id: SEAT_ID, status: ReservationStatus.HOLD, hold_until: new Date(Date.now() + 10 * 60 * 1000) },
+      );
 
       await expect(service.createHold(SEAT_ID, USER_ID)).rejects.toThrow(
         ConflictException,
       );
-      expect(reservationRepo.create).not.toHaveBeenCalled();
+      expect(mockManager.save).not.toHaveBeenCalled();
     });
 
     it('allows a new hold when the previous hold on the same seat has expired', async () => {
-      seatRepo.findOne.mockResolvedValue({
-        id: SEAT_ID,
-        status: SeatStatus.AVAILABLE,
-      });
-      // No active (non-expired) hold found by the query
-      reservationRepo.findOne.mockResolvedValue(null);
-      reservationRepo.create.mockImplementation((dto) => ({ ...dto }));
-      reservationRepo.save.mockImplementation((entity) =>
-        Promise.resolve({ id: RESERVATION_ID, ...entity }),
-      );
+      setupManagerMocks({ id: SEAT_ID, status: SeatStatus.AVAILABLE }, null);
 
       const result = await service.createHold(SEAT_ID, USER_ID);
 
       expect(result.status).toBe(ReservationStatus.HOLD);
-      expect(reservationRepo.save).toHaveBeenCalled();
+      expect(mockManager.save).toHaveBeenCalled();
     });
 
     it('throws NotFoundException when seat does not exist', async () => {
-      seatRepo.findOne.mockResolvedValue(null);
+      setupManagerMocks(null, null);
 
       await expect(service.createHold(SEAT_ID, USER_ID)).rejects.toThrow(
         NotFoundException,

@@ -40,12 +40,14 @@ export class ReservationsController {
   @Get()
   @ApiOperation({ summary: 'List reservations with optional filters' })
   @ApiQuery({ name: 'seatId', required: false, type: 'string' })
-  @ApiQuery({ name: 'userId', required: false, type: 'string' })
   @ApiResponse({ status: 200, description: 'List of reservations' })
   findAll(
+    @CurrentUser() user: any,
     @Query('seatId') seatId?: string,
-    @Query('userId') userId?: string,
   ) {
+    // Non-admin users can only see their own reservations
+    const isAdmin = user.role === 'platform_admin' || user.role === 'store_admin';
+    const userId = isAdmin ? undefined : user.id;
     return this.reservationsService.findAll({ seatId, userId });
   }
 

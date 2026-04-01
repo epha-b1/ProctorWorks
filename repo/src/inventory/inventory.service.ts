@@ -11,6 +11,7 @@ import { InventoryLot } from './entities/inventory-lot.entity';
 import { InventoryAdjustment } from './entities/inventory-adjustment.entity';
 import { CreateLotDto } from './dto/create-lot.dto';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
+import { NotificationsService } from '../notifications/notifications.service';
 
 @Injectable()
 export class InventoryService {
@@ -22,6 +23,7 @@ export class InventoryService {
     @InjectRepository(InventoryAdjustment)
     private readonly adjustmentRepo: Repository<InventoryAdjustment>,
     private readonly configService: ConfigService,
+    private readonly notificationsService: NotificationsService,
   ) {}
 
   /* ── Lots ── */
@@ -63,7 +65,6 @@ export class InventoryService {
     dto: AdjustStockDto,
     userId: string,
   ): Promise<{ adjustment: InventoryAdjustment; alreadyExisted: boolean }> {
-    // Idempotency check
     const existing = await this.adjustmentRepo.findOne({
       where: { idempotency_key: dto.idempotencyKey },
     });
@@ -84,11 +85,15 @@ export class InventoryService {
     });
     const saved = await this.adjustmentRepo.save(adjustment);
 
-    // Check low stock threshold
+    // Check low stock threshold — persist notification
     const threshold = this.configService.get<number>('lowStockThreshold', 10);
-    if (lot.quantity < threshold) {
+    if (lot.quantity < threshold && lot.quantity >= 0) {
       this.logger.warn(
-        `Low stock alert: Lot ${lot.id} (SKU ${lot.sku_id}) quantity is ${lot.quantity}, below threshold ${threshold}`,
+        `Low stock: Lot ${lot.id} (SKU ${lot.sku_id}) has ${lot.quantity} units (threshold: ${threshold})`,
+      );
+      await this.notificationsService.createForAdmins(
+        'low_stock',
+        `Low stock alert: Lot ${lot.id} (SKU ${lot.sku_id}) has ${lot.quantity} units, below threshold of ${threshold}.`,
       );
     }
 
@@ -104,16 +109,18 @@ export class InventoryService {
     const dateStr = sevenDaysFromNow.toISOString().split('T')[0];
 
     const expiringLots = await this.lotRepo.find({
-      where: {
-        expiration_date: LessThanOrEqual(dateStr),
-      },
+      where: { expiration_date: LessThanOrEqual(dateStr) },
       relations: ['sku'],
     });
 
     for (const lot of expiringLots) {
       if (lot.quantity > 0) {
         this.logger.warn(
-          `Expiring lot alert: Lot ${lot.id} (batch ${lot.batch_code}) expires on ${lot.expiration_date} with ${lot.quantity} units remaining`,
+          `Expiring lot: ${lot.id} (batch ${lot.batch_code}) expires ${lot.expiration_date} with ${lot.quantity} units`,
+        );
+        await this.notificationsService.createForAdmins(
+          'expiring_inventory',
+          `Lot ${lot.id} (batch ${lot.batch_code}) expires on ${lot.expiration_date} with ${lot.quantity} units remaining.`,
         );
       }
     }
@@ -131,6 +138,10 @@ export class InventoryService {
     for (const lot of lots) {
       this.logger.warn(
         `Low stock: Lot ${lot.id} (SKU ${lot.sku_id}) has ${lot.quantity} units`,
+      );
+      await this.notificationsService.createForAdmins(
+        'low_stock',
+        `Low stock: Lot ${lot.id} (SKU ${lot.sku_id}) has ${lot.quantity} units (threshold: ${threshold}).`,
       );
     }
   }

@@ -93,6 +93,11 @@ export class OrdersService {
 
     const storeId = this.enforceStoreScope(user) || user.store_id;
 
+    // Encrypt internal notes if provided
+    const encryptedNotes = dto.internalNotes
+      ? this.encryptionService.encrypt(dto.internalNotes)
+      : null;
+
     // 4. Create order + items in transaction
     return this.dataSource.transaction(async (manager) => {
       const order = manager.create(Order, {
@@ -101,6 +106,7 @@ export class OrdersService {
         idempotency_key: dto.idempotencyKey,
         total_cents: totalCents,
         discount_cents: discountCents,
+        internal_notes: encryptedNotes,
         status: OrderStatus.PENDING,
       });
       const savedOrder = await manager.save(order);
@@ -132,12 +138,18 @@ export class OrdersService {
     });
   }
 
-  async confirmOrder(id: string): Promise<Order> {
-    const order = await this.orderRepo.findOne({
-      where: { id },
-      relations: ['items'],
+  private findOrderScoped(id: string, user: any): Promise<Order> {
+    const where: any = { id };
+    const storeId = this.enforceStoreScope(user);
+    if (storeId) where.store_id = storeId;
+    return this.orderRepo.findOne({ where, relations: ['items'] }).then(order => {
+      if (!order) throw new NotFoundException(`Order ${id} not found`);
+      return order;
     });
-    if (!order) throw new NotFoundException(`Order ${id} not found`);
+  }
+
+  async confirmOrder(id: string, user?: any): Promise<Order> {
+    const order = await this.findOrderScoped(id, user || {});
     if (order.status !== OrderStatus.PENDING) {
       throw new ConflictException(
         `Cannot confirm order in status '${order.status}'. Must be 'pending'.`,
@@ -147,12 +159,8 @@ export class OrdersService {
     return this.orderRepo.save(order);
   }
 
-  async fulfillOrder(id: string): Promise<Order> {
-    const order = await this.orderRepo.findOne({
-      where: { id },
-      relations: ['items'],
-    });
-    if (!order) throw new NotFoundException(`Order ${id} not found`);
+  async fulfillOrder(id: string, user?: any): Promise<Order> {
+    const order = await this.findOrderScoped(id, user || {});
     if (order.status !== OrderStatus.CONFIRMED) {
       throw new ConflictException(
         `Cannot fulfill order in status '${order.status}'. Must be 'confirmed'.`,
@@ -162,12 +170,8 @@ export class OrdersService {
     return this.orderRepo.save(order);
   }
 
-  async cancelOrder(id: string): Promise<Order> {
-    const order = await this.orderRepo.findOne({
-      where: { id },
-      relations: ['items'],
-    });
-    if (!order) throw new NotFoundException(`Order ${id} not found`);
+  async cancelOrder(id: string, user?: any): Promise<Order> {
+    const order = await this.findOrderScoped(id, user || {});
     if (
       order.status !== OrderStatus.PENDING &&
       order.status !== OrderStatus.CONFIRMED
@@ -187,13 +191,8 @@ export class OrdersService {
     return this.orderRepo.find({ where, relations: ['items'] });
   }
 
-  async findById(id: string): Promise<Order> {
-    const order = await this.orderRepo.findOne({
-      where: { id },
-      relations: ['items'],
-    });
-    if (!order) throw new NotFoundException(`Order ${id} not found`);
-    // Decrypt internal_notes if encrypted
+  async findById(id: string, user?: any): Promise<Order> {
+    const order = await this.findOrderScoped(id, user || {});
     if (order.internal_notes && this.encryptionService.isEncrypted(order.internal_notes)) {
       order.internal_notes = this.encryptionService.decrypt(order.internal_notes);
     }

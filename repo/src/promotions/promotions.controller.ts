@@ -6,9 +6,10 @@ import {
   Delete,
   Body,
   Param,
-  Query,
   ParseUUIDPipe,
   UseGuards,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -37,7 +38,8 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'List promotions' })
   @ApiResponse({ status: 200, description: 'List of promotions' })
-  findPromotions(@Query('storeId') storeId?: string) {
+  findPromotions(@CurrentUser() user: any) {
+    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
     return this.promotionsService.findPromotions(storeId);
   }
 
@@ -45,7 +47,10 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a promotion' })
   @ApiResponse({ status: 201, description: 'Promotion created' })
-  createPromotion(@Body() dto: CreatePromotionDto) {
+  createPromotion(@Body() dto: CreatePromotionDto, @CurrentUser() user: any) {
+    if (user.role === 'store_admin') {
+      dto.storeId = user.storeId;
+    }
     return this.promotionsService.createPromotion(dto);
   }
 
@@ -53,35 +58,26 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Update a promotion' })
   @ApiResponse({ status: 200, description: 'Promotion updated' })
-  async updatePromotion(
+  updatePromotion(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: Partial<CreatePromotionDto>,
+    @CurrentUser() user: any,
   ) {
-    const existing = await this.promotionsService.findPromotions();
-    const promo = existing.find((p) => p.id === id);
-    if (!promo) {
-      return { message: 'Promotion not found' };
-    }
-    Object.assign(promo, {
-      ...(dto.name !== undefined && { name: dto.name }),
-      ...(dto.type !== undefined && { type: dto.type }),
-      ...(dto.priority !== undefined && { priority: dto.priority }),
-      ...(dto.discountType !== undefined && { discount_type: dto.discountType }),
-      ...(dto.discountValue !== undefined && { discount_value: dto.discountValue }),
-      ...(dto.minOrderCents !== undefined && { min_order_cents: dto.minOrderCents }),
-      ...(dto.startsAt !== undefined && { starts_at: dto.startsAt ? new Date(dto.startsAt) : null }),
-      ...(dto.endsAt !== undefined && { ends_at: dto.endsAt ? new Date(dto.endsAt) : null }),
-      ...(dto.redemptionCap !== undefined && { redemption_cap: dto.redemptionCap }),
-    });
-    return promo;
+    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
+    return this.promotionsService.updatePromotion(id, dto, storeId);
   }
 
   @Delete('promotions/:id')
   @Roles('store_admin', 'platform_admin')
+  @HttpCode(HttpStatus.NO_CONTENT)
   @ApiOperation({ summary: 'Delete a promotion' })
-  @ApiResponse({ status: 200, description: 'Promotion deleted' })
-  async deletePromotion(@Param('id', ParseUUIDPipe) id: string) {
-    return { message: 'Promotion deleted', id };
+  @ApiResponse({ status: 204, description: 'Promotion deleted' })
+  deletePromotion(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+  ) {
+    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
+    return this.promotionsService.deletePromotion(id, storeId);
   }
 
   // ---- Coupons ----
@@ -90,7 +86,8 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'List coupons' })
   @ApiResponse({ status: 200, description: 'List of coupons' })
-  findCoupons(@Query('storeId') storeId?: string) {
+  findCoupons(@CurrentUser() user: any) {
+    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
     return this.promotionsService.findCoupons(storeId);
   }
 
@@ -98,7 +95,10 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a coupon' })
   @ApiResponse({ status: 201, description: 'Coupon created' })
-  createCoupon(@Body() dto: CreateCouponDto) {
+  createCoupon(@Body() dto: CreateCouponDto, @CurrentUser() user: any) {
+    if (user.role === 'store_admin') {
+      dto.storeId = user.storeId;
+    }
     return this.promotionsService.createCoupon(dto);
   }
 

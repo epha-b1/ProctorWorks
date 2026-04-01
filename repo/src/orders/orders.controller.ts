@@ -40,10 +40,7 @@ export class OrdersController {
     @CurrentUser() user: any,
     @Res({ passthrough: true }) res: Response,
   ) {
-    const { order, alreadyExisted } = await this.ordersService.createOrder(
-      dto,
-      user,
-    );
+    const { order, alreadyExisted } = await this.ordersService.createOrder(dto, user);
     res.status(alreadyExisted ? HttpStatus.OK : HttpStatus.CREATED);
     return order;
   }
@@ -61,8 +58,11 @@ export class OrdersController {
   @ApiOperation({ summary: 'Get order by ID' })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Order details' })
-  findById(@Param('id', ParseUUIDPipe) id: string) {
-    return this.ordersService.findById(id);
+  findById(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.ordersService.findById(id, user);
   }
 
   @Post(':id/confirm')
@@ -71,8 +71,11 @@ export class OrdersController {
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Order confirmed' })
   @ApiResponse({ status: 409, description: 'Invalid status transition' })
-  confirmOrder(@Param('id', ParseUUIDPipe) id: string) {
-    return this.ordersService.confirmOrder(id);
+  confirmOrder(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.ordersService.confirmOrder(id, user);
   }
 
   @Post(':id/fulfill')
@@ -81,8 +84,11 @@ export class OrdersController {
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Order fulfilled' })
   @ApiResponse({ status: 409, description: 'Invalid status transition' })
-  fulfillOrder(@Param('id', ParseUUIDPipe) id: string) {
-    return this.ordersService.fulfillOrder(id);
+  fulfillOrder(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.ordersService.fulfillOrder(id, user);
   }
 
   @Post(':id/cancel')
@@ -91,7 +97,10 @@ export class OrdersController {
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Order cancelled' })
   @ApiResponse({ status: 409, description: 'Invalid status transition' })
-  cancelOrder(@Param('id', ParseUUIDPipe) id: string) {
-    return this.ordersService.cancelOrder(id);
+  cancelOrder(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.ordersService.cancelOrder(id, user);
   }
 }

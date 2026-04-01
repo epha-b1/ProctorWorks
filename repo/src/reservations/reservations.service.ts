@@ -5,7 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, MoreThan } from 'typeorm';
+import { Repository, MoreThan, DataSource } from 'typeorm';
 import { Cron } from '@nestjs/schedule';
 import { Reservation, ReservationStatus } from './entities/reservation.entity';
 import { Seat, SeatStatus } from '../rooms/entities/seat.entity';
@@ -17,38 +17,47 @@ export class ReservationsService {
     private readonly reservationRepo: Repository<Reservation>,
     @InjectRepository(Seat)
     private readonly seatRepo: Repository<Seat>,
+    private readonly dataSource: DataSource,
   ) {}
 
   async createHold(seatId: string, userId: string): Promise<Reservation> {
-    // Check seat exists and is not in maintenance
-    const seat = await this.seatRepo.findOne({ where: { id: seatId } });
-    if (!seat) throw new NotFoundException(`Seat ${seatId} not found`);
-    if (seat.status === SeatStatus.MAINTENANCE) {
-      throw new BadRequestException('Seat is currently under maintenance');
-    }
+    // Use a transaction with row-level lock to prevent race conditions
+    return this.dataSource.transaction(async (manager) => {
+      // Lock the seat row for the duration of this transaction
+      const seat = await manager
+        .createQueryBuilder(Seat, 'seat')
+        .setLock('pessimistic_write')
+        .where('seat.id = :seatId', { seatId })
+        .getOne();
 
-    // Check no active hold exists for this seat
-    const activeHold = await this.reservationRepo.findOne({
-      where: {
+      if (!seat) throw new NotFoundException(`Seat ${seatId} not found`);
+      if (seat.status === SeatStatus.MAINTENANCE) {
+        throw new BadRequestException('Seat is currently under maintenance');
+      }
+
+      // Check no active hold exists (within the same locked transaction)
+      const activeHold = await manager.findOne(Reservation, {
+        where: {
+          seat_id: seatId,
+          status: ReservationStatus.HOLD,
+          hold_until: MoreThan(new Date()),
+        },
+      });
+      if (activeHold) {
+        throw new ConflictException('An active hold already exists for this seat');
+      }
+
+      const holdUntil = new Date(Date.now() + 15 * 60 * 1000);
+
+      const reservation = manager.create(Reservation, {
         seat_id: seatId,
+        user_id: userId,
         status: ReservationStatus.HOLD,
-        hold_until: MoreThan(new Date()),
-      },
+        hold_until: holdUntil,
+      });
+
+      return manager.save(reservation);
     });
-    if (activeHold) {
-      throw new ConflictException('An active hold already exists for this seat');
-    }
-
-    const holdUntil = new Date(Date.now() + 15 * 60 * 1000);
-
-    const reservation = this.reservationRepo.create({
-      seat_id: seatId,
-      user_id: userId,
-      status: ReservationStatus.HOLD,
-      hold_until: holdUntil,
-    });
-
-    return this.reservationRepo.save(reservation);
   }
 
   async confirm(reservationId: string, userId: string): Promise<Reservation> {
