@@ -18,14 +18,19 @@ import {
 import { ReservationsService } from './reservations.service';
 import { CreateReservationDto } from './dto/create-reservation.dto';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { Roles } from '../common/decorators/roles.decorator';
+import { UseGuards } from '@nestjs/common';
+import { RolesGuard } from '../common/guards/roles.guard';
 
 @ApiTags('Reservations')
 @ApiBearerAuth()
 @Controller('reservations')
+@UseGuards(RolesGuard)
 export class ReservationsController {
   constructor(private readonly reservationsService: ReservationsService) {}
 
   @Post()
+  @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a seat hold (15 min)' })
   @ApiResponse({ status: 201, description: 'Hold created' })
   @ApiResponse({ status: 400, description: 'Seat under maintenance' })
@@ -38,6 +43,7 @@ export class ReservationsController {
   }
 
   @Get()
+  @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'List reservations with optional filters' })
   @ApiQuery({ name: 'seatId', required: false, type: 'string' })
   @ApiResponse({ status: 200, description: 'List of reservations' })
@@ -52,6 +58,7 @@ export class ReservationsController {
   }
 
   @Post(':id/confirm')
+  @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Confirm a held reservation' })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Reservation confirmed' })
@@ -64,6 +71,7 @@ export class ReservationsController {
   }
 
   @Post(':id/cancel')
+  @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Cancel a reservation' })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Reservation cancelled' })

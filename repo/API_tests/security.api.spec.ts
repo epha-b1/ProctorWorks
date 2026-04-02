@@ -187,6 +187,89 @@ describe('Security & Authorization', () => {
       const list = await request(server).get('/promotions').set('Authorization', `Bearer ${adminToken}`);
       expect(list.body.find((p: any) => p.id === id)).toBeUndefined();
     });
+
+    it('store_admin cannot distribute coupon from another store → 403/404', async () => {
+      const promo = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: `CrossStorePromo${U}`,
+          type: 'percentage',
+          priority: 90,
+          discountType: 'percentage',
+          discountValue: 5,
+        });
+      expect(promo.status).toBe(201);
+
+      const coupon = await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          code: `XSTORE-${U}`,
+          promotionId: promo.body.id,
+          remainingQuantity: 5,
+        });
+      expect(coupon.status).toBe(201);
+
+      const me = await request(server)
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${storeAdminToken}`);
+      expect(me.status).toBe(200);
+
+      const res = await request(server)
+        .post(`/coupons/${coupon.body.id}/distribute`)
+        .set('Authorization', `Bearer ${storeAdminToken}`)
+        .send({ userIds: [me.body.id] });
+
+      expect([403, 404]).toContain(res.status);
+    });
+  });
+
+  // ── Inventory store isolation ──────────────────────────────────────────
+  describe('Inventory store isolation', () => {
+    it('store_admin cannot update lot from another store scope → 403/404', async () => {
+      const cat = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `InvSecCat${U}` });
+      expect(cat.status).toBe(201);
+
+      const brand = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `InvSecBrand${U}` });
+      expect(brand.status).toBe(201);
+
+      const prod = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `InvSecProd${U}`, categoryId: cat.body.id, brandId: brand.body.id });
+      expect(prod.status).toBe(201);
+
+      const sku = await request(server)
+        .post(`/products/${prod.body.id}/skus`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ skuCode: `INVSEC-${U}`, priceCents: 700 });
+      expect(sku.status).toBe(201);
+
+      const lot = await request(server)
+        .post('/inventory/lots')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          skuId: sku.body.id,
+          batchCode: `LOT-${U}`,
+          quantity: 20,
+          expirationDate: '2027-01-01',
+        });
+      expect(lot.status).toBe(201);
+
+      const res = await request(server)
+        .patch(`/inventory/lots/${lot.body.id}`)
+        .set('Authorization', `Bearer ${storeAdminToken}`)
+        .send({ quantity: 1 });
+
+      expect([403, 404]).toContain(res.status);
+    });
   });
 
   // ── Role 403 matrix ────────────────────────────────────────────────────
@@ -212,6 +295,29 @@ describe('Security & Authorization', () => {
     it('auditor cannot create orders → 403', async () => {
       const res = await request(server).post('/orders').set('Authorization', `Bearer ${auditorToken}`)
         .send({ idempotencyKey: 'x', items: [] });
+      expect(res.status).toBe(403);
+    });
+
+    it('auditor cannot create reservations → 403', async () => {
+      const res = await request(server)
+        .post('/reservations')
+        .set('Authorization', `Bearer ${auditorToken}`)
+        .send({ seatId: '00000000-0000-0000-0000-000000000000' });
+      expect(res.status).toBe(403);
+    });
+
+    it('auditor cannot create questions → 403', async () => {
+      const res = await request(server)
+        .post('/questions')
+        .set('Authorization', `Bearer ${auditorToken}`)
+        .send({
+          type: 'objective',
+          body: `forbidden-${U}`,
+          options: [
+            { body: 'A', isCorrect: true },
+            { body: 'B', isCorrect: false },
+          ],
+        });
       expect(res.status).toBe(403);
     });
 

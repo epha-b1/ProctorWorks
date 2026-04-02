@@ -46,6 +46,7 @@ export class QuestionsController {
   }
 
   @Post()
+  @Roles('store_admin', 'content_reviewer', 'platform_admin')
   @ApiOperation({ summary: 'Create a question' })
   @ApiResponse({ status: 201, description: 'Question created' })
   createQuestion(
@@ -89,6 +90,7 @@ export class QuestionsController {
   }
 
   @Patch(':id')
+  @Roles('store_admin', 'content_reviewer', 'platform_admin')
   @ApiOperation({ summary: 'Update a question' })
   @ApiResponse({ status: 200, description: 'Question updated' })
   updateQuestion(
@@ -99,6 +101,7 @@ export class QuestionsController {
   }
 
   @Delete(':id')
+  @Roles('store_admin', 'content_reviewer', 'platform_admin')
   @ApiOperation({ summary: 'Delete a question' })
   @ApiResponse({ status: 200, description: 'Question deleted' })
   deleteQuestion(@Param('id', ParseUUIDPipe) id: string) {
@@ -136,6 +139,7 @@ export class QuestionsController {
   }
 
   @Post(':id/explanations')
+  @Roles('store_admin', 'content_reviewer', 'platform_admin')
   @ApiOperation({ summary: 'Add an explanation to a question' })
   @ApiResponse({ status: 201, description: 'Explanation added' })
   addExplanation(
