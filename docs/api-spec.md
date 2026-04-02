@@ -627,6 +627,25 @@ paths:
       responses:
         "200":
           description: Confirmed
+        "409":
+          description: Cannot confirm in current state
+
+  /orders/{id}/fulfill:
+    post:
+      tags: [Orders]
+      summary: Fulfill order
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Fulfilled
+        "409":
+          description: Cannot fulfill in current state
 
   /orders/{id}/cancel:
     post:

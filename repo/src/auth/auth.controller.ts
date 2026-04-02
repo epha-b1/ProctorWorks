@@ -81,6 +81,7 @@ export class AuthController {
       dto.currentPassword,
       dto.newPassword,
     );
+    await this.auditService.log(userId, 'change_password', 'user', userId);
     return { message: 'Password changed successfully' };
   }
 }
@@ -89,7 +90,10 @@ export class AuthController {
 @ApiBearerAuth()
 @Controller('users')
 export class UsersController {
-  constructor(private readonly authService: AuthService) {}
+  constructor(
+    private readonly authService: AuthService,
+    private readonly auditService: AuditService,
+  ) {}
 
   @Get()
   @Roles(UserRole.PLATFORM_ADMIN)
@@ -112,8 +116,13 @@ export class UsersController {
   @ApiOperation({ summary: 'Create a new user (platform_admin only)' })
   @ApiResponse({ status: 201, description: 'User created' })
   @ApiResponse({ status: 409, description: 'Username already exists' })
-  create(@Body() dto: CreateUserDto) {
-    return this.authService.createUser(dto);
+  async create(@Body() dto: CreateUserDto, @CurrentUser('id') actorId: string) {
+    const created = await this.authService.createUser(dto);
+    await this.auditService.log(actorId, 'create_user', 'user', created.id, {
+      role: created.role,
+      storeId: created.store_id ?? null,
+    });
+    return created;
   }
 
   @Get(':id')
@@ -133,8 +142,14 @@ export class UsersController {
   update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateUserDto,
+    @CurrentUser('id') actorId: string,
   ) {
-    return this.authService.updateUser(id, dto);
+    return this.authService.updateUser(id, dto).then(async (updated) => {
+      await this.auditService.log(actorId, 'update_user', 'user', id, {
+        fields: Object.keys(dto || {}),
+      });
+      return updated;
+    });
   }
 
   @Delete(':id')
@@ -143,7 +158,12 @@ export class UsersController {
   @ApiOperation({ summary: 'Delete user (platform_admin only)' })
   @ApiResponse({ status: 204, description: 'User deleted' })
   @ApiResponse({ status: 404, description: 'User not found' })
-  remove(@Param('id', ParseUUIDPipe) id: string) {
-    return this.authService.deleteUser(id);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser('id') actorId: string,
+  ) {
+    await this.authService.deleteUser(id);
+    await this.auditService.log(actorId, 'delete_user', 'user', id);
+    return;
   }
 }

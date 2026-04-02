@@ -3,6 +3,7 @@ import {
   BadRequestException,
   NotFoundException,
   Logger,
+  ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, LessThanOrEqual, MoreThanOrEqual, IsNull } from 'typeorm';
@@ -31,6 +32,23 @@ export class PromotionsService {
     @InjectRepository(CouponClaim)
     private readonly claimRepo: Repository<CouponClaim>,
   ) {}
+
+  private getUserStoreId(user: any): string | null {
+    return user?.storeId ?? user?.store_id ?? null;
+  }
+
+  private enforceCouponScope(coupon: Coupon, user?: any): void {
+    if (user?.role !== 'store_admin') {
+      return;
+    }
+    const storeId = this.getUserStoreId(user);
+    if (!storeId) {
+      throw new ForbiddenException('Store admin has no assigned store');
+    }
+    if (coupon.store_id !== storeId) {
+      throw new NotFoundException('Coupon not found');
+    }
+  }
 
   async createPromotion(dto: CreatePromotionDto): Promise<Promotion> {
     const promotion = this.promotionRepo.create({
@@ -96,11 +114,16 @@ export class PromotionsService {
     return savedClaim;
   }
 
-  async distributeCoupon(couponId: string, userIds: string[]): Promise<CouponClaim[]> {
+  async distributeCoupon(
+    couponId: string,
+    userIds: string[],
+    user?: any,
+  ): Promise<CouponClaim[]> {
     const coupon = await this.couponRepo.findOne({ where: { id: couponId } });
     if (!coupon) {
       throw new NotFoundException('Coupon not found');
     }
+    this.enforceCouponScope(coupon, user);
 
     const now = new Date();
     const claims = userIds.map((userId) =>
@@ -118,11 +141,13 @@ export class PromotionsService {
     code: string,
     userId: string,
     orderId: string,
+    user?: any,
   ): Promise<CouponClaim> {
     const coupon = await this.couponRepo.findOne({ where: { code } });
     if (!coupon) {
       throw new NotFoundException('Coupon not found');
     }
+    this.enforceCouponScope(coupon, user);
 
     const claim = await this.claimRepo.findOne({
       where: { coupon_id: coupon.id, user_id: userId, redeemed_at: IsNull() },
@@ -136,11 +161,12 @@ export class PromotionsService {
     return this.claimRepo.save(claim);
   }
 
-  async expireCoupon(id: string): Promise<Coupon> {
+  async expireCoupon(id: string, user?: any): Promise<Coupon> {
     const coupon = await this.couponRepo.findOne({ where: { id } });
     if (!coupon) {
       throw new NotFoundException('Coupon not found');
     }
+    this.enforceCouponScope(coupon, user);
     coupon.status = CouponStatus.EXPIRED;
     return this.couponRepo.save(coupon);
   }

@@ -6,10 +6,12 @@ import { Seat } from './entities/seat.entity';
 import { SeatMapVersion } from './entities/seat-map-version.entity';
 import { RoomsService } from './rooms.service';
 import { RoomsController } from './rooms.controller';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([StudyRoom, Zone, Seat, SeatMapVersion]),
+    AuditModule,
   ],
   controllers: [RoomsController],
   providers: [RoomsService],

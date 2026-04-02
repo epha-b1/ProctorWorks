@@ -25,13 +25,17 @@ import { PublishSeatMapDto } from './dto/publish-seat-map.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Rooms')
 @ApiBearerAuth()
 @Controller()
 @UseGuards(RolesGuard)
 export class RoomsController {
-  constructor(private readonly roomsService: RoomsService) {}
+  constructor(
+    private readonly roomsService: RoomsService,
+    private readonly auditService: AuditService,
+  ) {}
 
   /* ── Rooms ── */
 
@@ -39,8 +43,10 @@ export class RoomsController {
   @Roles('platform_admin')
   @ApiOperation({ summary: 'Create a study room' })
   @ApiResponse({ status: 201, description: 'Room created' })
-  createRoom(@Body() dto: CreateRoomDto) {
-    return this.roomsService.createRoom(dto);
+  async createRoom(@Body() dto: CreateRoomDto, @CurrentUser('id') actorId: string) {
+    const room = await this.roomsService.createRoom(dto);
+    await this.auditService.log(actorId, 'create_room', 'room', room.id);
+    return room;
   }
 
   @Get('rooms')
@@ -66,8 +72,14 @@ export class RoomsController {
   updateRoom(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateRoomDto,
+    @CurrentUser('id') actorId: string,
   ) {
-    return this.roomsService.updateRoom(id, dto);
+    return this.roomsService.updateRoom(id, dto).then(async (room) => {
+      await this.auditService.log(actorId, 'update_room', 'room', id, {
+        fields: Object.keys(dto || {}),
+      });
+      return room;
+    });
   }
 
   @Delete('rooms/:id')
@@ -75,8 +87,14 @@ export class RoomsController {
   @ApiOperation({ summary: 'Delete a study room' })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Room deleted' })
-  deleteRoom(@Param('id', ParseUUIDPipe) id: string) {
-    return this.roomsService.deleteRoom(id);
+  deleteRoom(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser('id') actorId: string,
+  ) {
+    return this.roomsService.deleteRoom(id).then(async (result) => {
+      await this.auditService.log(actorId, 'delete_room', 'room', id);
+      return result;
+    });
   }
 
   /* ── Zones ── */
@@ -97,8 +115,14 @@ export class RoomsController {
   createZone(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateZoneDto,
+    @CurrentUser('id') actorId: string,
   ) {
-    return this.roomsService.createZone(id, dto);
+    return this.roomsService.createZone(id, dto).then(async (zone) => {
+      await this.auditService.log(actorId, 'create_zone', 'zone', zone.id, {
+        roomId: id,
+      });
+      return zone;
+    });
   }
 
   /* ── Seats ── */
@@ -119,8 +143,14 @@ export class RoomsController {
   createSeat(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateSeatDto,
+    @CurrentUser('id') actorId: string,
   ) {
-    return this.roomsService.createSeat(id, dto);
+    return this.roomsService.createSeat(id, dto).then(async (seat) => {
+      await this.auditService.log(actorId, 'create_seat', 'seat', seat.id, {
+        zoneId: id,
+      });
+      return seat;
+    });
   }
 
   @Patch('seats/:id')
@@ -131,8 +161,14 @@ export class RoomsController {
   updateSeat(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateSeatDto,
+    @CurrentUser('id') actorId: string,
   ) {
-    return this.roomsService.updateSeat(id, dto);
+    return this.roomsService.updateSeat(id, dto).then(async (seat) => {
+      await this.auditService.log(actorId, 'update_seat', 'seat', id, {
+        fields: Object.keys(dto || {}),
+      });
+      return seat;
+    });
   }
 
   @Delete('seats/:id')
@@ -140,8 +176,14 @@ export class RoomsController {
   @ApiOperation({ summary: 'Delete a seat' })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Seat deleted' })
-  deleteSeat(@Param('id', ParseUUIDPipe) id: string) {
-    return this.roomsService.deleteSeat(id);
+  deleteSeat(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser('id') actorId: string,
+  ) {
+    return this.roomsService.deleteSeat(id).then(async (result) => {
+      await this.auditService.log(actorId, 'delete_seat', 'seat', id);
+      return result;
+    });
   }
 
   /* ── Seat-Map Versioning ── */
@@ -156,7 +198,12 @@ export class RoomsController {
     @Body() dto: PublishSeatMapDto,
     @CurrentUser('id') userId: string,
   ) {
-    return this.roomsService.publishSeatMap(id, dto.changeNote, userId);
+    return this.roomsService.publishSeatMap(id, dto.changeNote, userId).then(async (version) => {
+      await this.auditService.log(userId, 'publish_seat_map', 'room', id, {
+        version: version.version_number,
+      });
+      return version;
+    });
   }
 
   @Get('rooms/:id/versions')

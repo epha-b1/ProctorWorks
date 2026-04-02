@@ -5,11 +5,14 @@ import { InventoryAdjustment } from './entities/inventory-adjustment.entity';
 import { InventoryService } from './inventory.service';
 import { InventoryController } from './inventory.controller';
 import { NotificationsModule } from '../notifications/notifications.module';
+import { Sku } from '../products/entities/sku.entity';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([InventoryLot, InventoryAdjustment]),
+    TypeOrmModule.forFeature([InventoryLot, InventoryAdjustment, Sku]),
     NotificationsModule,
+    AuditModule,
   ],
   controllers: [InventoryController],
   providers: [InventoryService],

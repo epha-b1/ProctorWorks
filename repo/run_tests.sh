@@ -9,6 +9,7 @@ echo ""
 DB_URL="postgres://proctorworks:proctorworks@db:5432/proctorworks"
 HEALTH_URL="http://localhost:3000/health"
 MAX_WAIT=60
+RESET_ATTEMPTED=0
 
 # ── Ensure containers are running ──────────────────────────────────────────────
 
@@ -48,7 +49,19 @@ wait_for_health() {
   echo ""
   echo "ERROR: API did not become healthy within ${MAX_WAIT}s"
   echo "--- API logs ---"
-  docker compose logs --tail 30 api
+  local api_logs
+  api_logs="$(docker compose logs --tail 50 api 2>/dev/null || true)"
+  echo "$api_logs"
+
+  if [ "$RESET_ATTEMPTED" -eq 0 ] && echo "$api_logs" | grep -qi "password authentication failed"; then
+    echo "Detected PostgreSQL auth mismatch (likely stale volume). Resetting volumes and retrying once..."
+    RESET_ATTEMPTED=1
+    docker compose down -v 2>/dev/null || true
+    docker compose up -d --build 2>&1 | grep -E "Created|Started|Building|Built" || true
+    wait_for_health
+    return 0
+  fi
+
   exit 1
 }
 

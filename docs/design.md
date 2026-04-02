@@ -42,7 +42,7 @@ NestJS HTTP Server (port 3000)
 | Validation | class-validator + class-transformer |
 | Scheduling | @nestjs/schedule |
 | API docs | @nestjs/swagger (Swagger UI at /api/docs) |
-| Logging | Winston with structured JSON |
+| Logging | Nest Logger with structured request/error interceptors |
 | Container | Docker + docker-compose |
 
 ---

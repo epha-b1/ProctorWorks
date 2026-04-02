@@ -440,4 +440,41 @@ describe('PromotionsService', () => {
       expect(result.totalDiscount).toBe(0);
     });
   });
+
+  /* -------------------------------------------------------------- */
+  /*  16. Tenant isolation for coupon operations                      */
+  /* -------------------------------------------------------------- */
+  describe('coupon tenant isolation', () => {
+    it('store_admin cannot distribute coupon from another store', async () => {
+      const { service, couponRepo } = createService();
+
+      couponRepo.findOne.mockResolvedValue(
+        makeCoupon({ id: 'coupon-x', store_id: 'store-a' }),
+      );
+
+      await expect(
+        service.distributeCoupon(
+          'coupon-x',
+          ['user-1', 'user-2'],
+          { id: 'admin-1', role: 'store_admin', storeId: 'store-b' },
+        ),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('store_admin can expire own-store coupon', async () => {
+      const { service, couponRepo } = createService();
+
+      const coupon = makeCoupon({ id: 'coupon-own', store_id: 'store-1' });
+      couponRepo.findOne.mockResolvedValue(coupon);
+
+      await service.expireCoupon(
+        'coupon-own',
+        { id: 'admin-1', role: 'store_admin', storeId: 'store-1' },
+      );
+
+      expect(couponRepo.save).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'coupon-own', status: CouponStatus.EXPIRED }),
+      );
+    });
+  });
 });

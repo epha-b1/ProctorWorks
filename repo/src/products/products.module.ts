@@ -7,10 +7,12 @@ import { Sku } from './entities/sku.entity';
 import { SkuPriceTier } from './entities/sku-price-tier.entity';
 import { ProductsService } from './products.service';
 import { ProductsController } from './products.controller';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([Product, Category, Brand, Sku, SkuPriceTier]),
+    AuditModule,
   ],
   controllers: [ProductsController],
   providers: [ProductsService],

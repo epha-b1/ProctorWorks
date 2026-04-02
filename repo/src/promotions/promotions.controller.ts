@@ -24,13 +24,17 @@ import { DistributeCouponDto } from './dto/distribute-coupon.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('promotions')
 @ApiBearerAuth()
 @Controller()
 @UseGuards(RolesGuard)
 export class PromotionsController {
-  constructor(private readonly promotionsService: PromotionsService) {}
+  constructor(
+    private readonly promotionsService: PromotionsService,
+    private readonly auditService: AuditService,
+  ) {}
 
   // ---- Promotions ----
 
@@ -47,11 +51,13 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a promotion' })
   @ApiResponse({ status: 201, description: 'Promotion created' })
-  createPromotion(@Body() dto: CreatePromotionDto, @CurrentUser() user: any) {
+  async createPromotion(@Body() dto: CreatePromotionDto, @CurrentUser() user: any) {
     if (user.role === 'store_admin') {
       dto.storeId = user.storeId;
     }
-    return this.promotionsService.createPromotion(dto);
+    const promotion = await this.promotionsService.createPromotion(dto);
+    await this.auditService.log(user.id, 'create_promotion', 'promotion', promotion.id);
+    return promotion;
   }
 
   @Patch('promotions/:id')
@@ -64,7 +70,12 @@ export class PromotionsController {
     @CurrentUser() user: any,
   ) {
     const storeId = user.role === 'store_admin' ? user.storeId : undefined;
-    return this.promotionsService.updatePromotion(id, dto, storeId);
+    return this.promotionsService.updatePromotion(id, dto, storeId).then(async (promotion) => {
+      await this.auditService.log(user.id, 'update_promotion', 'promotion', id, {
+        fields: Object.keys(dto || {}),
+      });
+      return promotion;
+    });
   }
 
   @Delete('promotions/:id')
@@ -77,7 +88,10 @@ export class PromotionsController {
     @CurrentUser() user: any,
   ) {
     const storeId = user.role === 'store_admin' ? user.storeId : undefined;
-    return this.promotionsService.deletePromotion(id, storeId);
+    return this.promotionsService.deletePromotion(id, storeId).then(async () => {
+      await this.auditService.log(user.id, 'delete_promotion', 'promotion', id);
+      return;
+    });
   }
 
   // ---- Coupons ----
@@ -95,11 +109,13 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a coupon' })
   @ApiResponse({ status: 201, description: 'Coupon created' })
-  createCoupon(@Body() dto: CreateCouponDto, @CurrentUser() user: any) {
+  async createCoupon(@Body() dto: CreateCouponDto, @CurrentUser() user: any) {
     if (user.role === 'store_admin') {
       dto.storeId = user.storeId;
     }
-    return this.promotionsService.createCoupon(dto);
+    const coupon = await this.promotionsService.createCoupon(dto);
+    await this.auditService.log(user.id, 'create_coupon', 'coupon', coupon.id);
+    return coupon;
   }
 
   @Post('coupons/:code/claim')
@@ -120,8 +136,9 @@ export class PromotionsController {
     @Param('code') code: string,
     @Body('userId') userId: string,
     @Body('orderId') orderId: string,
+    @CurrentUser() user: any,
   ) {
-    return this.promotionsService.redeemCoupon(code, userId, orderId);
+    return this.promotionsService.redeemCoupon(code, userId, orderId, user);
   }
 
   @Post('coupons/:id/distribute')
@@ -131,15 +148,27 @@ export class PromotionsController {
   distributeCoupon(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: DistributeCouponDto,
+    @CurrentUser() user: any,
   ) {
-    return this.promotionsService.distributeCoupon(id, dto.userIds);
+    return this.promotionsService.distributeCoupon(id, dto.userIds, user).then(async (claims) => {
+      await this.auditService.log(user.id, 'distribute_coupon', 'coupon', id, {
+        recipientCount: dto.userIds.length,
+      });
+      return claims;
+    });
   }
 
   @Post('coupons/:id/expire')
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Expire a coupon' })
   @ApiResponse({ status: 200, description: 'Coupon expired' })
-  expireCoupon(@Param('id', ParseUUIDPipe) id: string) {
-    return this.promotionsService.expireCoupon(id);
+  expireCoupon(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+  ) {
+    return this.promotionsService.expireCoupon(id, user).then(async (coupon) => {
+      await this.auditService.log(user.id, 'expire_coupon', 'coupon', id);
+      return coupon;
+    });
   }
 }

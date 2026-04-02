@@ -27,20 +27,28 @@ import { AdjustStockDto } from './dto/adjust-stock.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Inventory')
 @ApiBearerAuth()
 @Controller('inventory')
 @UseGuards(RolesGuard)
 export class InventoryController {
-  constructor(private readonly inventoryService: InventoryService) {}
+  constructor(
+    private readonly inventoryService: InventoryService,
+    private readonly auditService: AuditService,
+  ) {}
 
   @Post('lots')
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create an inventory lot' })
   @ApiResponse({ status: 201, description: 'Lot created' })
-  createLot(@Body() dto: CreateLotDto) {
-    return this.inventoryService.createLot(dto);
+  async createLot(@Body() dto: CreateLotDto, @CurrentUser() user: any) {
+    const lot = await this.inventoryService.createLot(dto, user);
+    await this.auditService.log(user.id, 'create_inventory_lot', 'inventory_lot', lot.id, {
+      skuId: dto.skuId,
+    });
+    return lot;
   }
 
   @Get('lots')
@@ -48,8 +56,8 @@ export class InventoryController {
   @ApiOperation({ summary: 'List inventory lots' })
   @ApiQuery({ name: 'skuId', required: false, type: 'string' })
   @ApiResponse({ status: 200, description: 'List of lots' })
-  findAllLots(@Query('skuId') skuId?: string) {
-    return this.inventoryService.findAllLots(skuId);
+  findAllLots(@CurrentUser() user: any, @Query('skuId') skuId?: string) {
+    return this.inventoryService.findAllLots(user, skuId);
   }
 
   @Patch('lots/:id')
@@ -60,13 +68,19 @@ export class InventoryController {
   updateLot(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: Partial<CreateLotDto>,
+    @CurrentUser() user: any,
   ) {
     const updates: any = {};
     if (dto.batchCode !== undefined) updates.batch_code = dto.batchCode;
     if (dto.expirationDate !== undefined)
       updates.expiration_date = dto.expirationDate;
     if (dto.quantity !== undefined) updates.quantity = dto.quantity;
-    return this.inventoryService.updateLot(id, updates);
+    return this.inventoryService.updateLot(id, updates, user).then(async (lot) => {
+      await this.auditService.log(user.id, 'update_inventory_lot', 'inventory_lot', id, {
+        fields: Object.keys(dto || {}),
+      });
+      return lot;
+    });
   }
 
   @Post('adjust')
@@ -78,13 +92,20 @@ export class InventoryController {
   async adjustStock(
     @Body() dto: AdjustStockDto,
     @CurrentUser('id') userId: string,
+    @CurrentUser() user: any,
     @Res({ passthrough: true }) res: Response,
   ) {
     const { adjustment, alreadyExisted } =
-      await this.inventoryService.adjustStock(dto, userId);
+      await this.inventoryService.adjustStock(dto, userId, user);
     if (!alreadyExisted) {
       res.status(HttpStatus.CREATED);
     }
+    await this.auditService.log(user.id, 'adjust_inventory_stock', 'inventory_lot', dto.lotId, {
+      delta: dto.delta,
+      reasonCode: dto.reasonCode,
+      idempotencyKey: dto.idempotencyKey,
+      alreadyExisted,
+    });
     return adjustment;
   }
 }

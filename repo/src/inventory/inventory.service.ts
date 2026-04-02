@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   Logger,
+  ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, LessThanOrEqual } from 'typeorm';
@@ -12,6 +13,7 @@ import { InventoryAdjustment } from './entities/inventory-adjustment.entity';
 import { CreateLotDto } from './dto/create-lot.dto';
 import { AdjustStockDto } from './dto/adjust-stock.dto';
 import { NotificationsService } from '../notifications/notifications.service';
+import { Sku } from '../products/entities/sku.entity';
 
 @Injectable()
 export class InventoryService {
@@ -22,13 +24,43 @@ export class InventoryService {
     private readonly lotRepo: Repository<InventoryLot>,
     @InjectRepository(InventoryAdjustment)
     private readonly adjustmentRepo: Repository<InventoryAdjustment>,
+    @InjectRepository(Sku)
+    private readonly skuRepo: Repository<Sku>,
     private readonly configService: ConfigService,
     private readonly notificationsService: NotificationsService,
   ) {}
 
+  private getUserStoreId(user: any): string | null {
+    return user?.storeId ?? user?.store_id ?? null;
+  }
+
+  private resolveStoreScope(user: any): string | null {
+    if (user?.role === 'store_admin') {
+      const storeId = this.getUserStoreId(user);
+      if (!storeId) {
+        throw new ForbiddenException('Store admin has no assigned store');
+      }
+      return storeId;
+    }
+    return null;
+  }
+
   /* ── Lots ── */
 
-  async createLot(dto: CreateLotDto): Promise<InventoryLot> {
+  async createLot(dto: CreateLotDto, user: any): Promise<InventoryLot> {
+    const storeId = this.resolveStoreScope(user);
+    if (storeId) {
+      const scopedSku = await this.skuRepo
+        .createQueryBuilder('sku')
+        .innerJoin('sku.product', 'product')
+        .where('sku.id = :skuId', { skuId: dto.skuId })
+        .andWhere('product.store_id = :storeId', { storeId })
+        .getOne();
+      if (!scopedSku) {
+        throw new NotFoundException(`SKU ${dto.skuId} not found`);
+      }
+    }
+
     const lot = this.lotRepo.create({
       sku_id: dto.skuId,
       batch_code: dto.batchCode,
@@ -38,14 +70,30 @@ export class InventoryService {
     return this.lotRepo.save(lot);
   }
 
-  async findAllLots(skuId?: string): Promise<InventoryLot[]> {
-    const where: any = {};
-    if (skuId) where.sku_id = skuId;
-    return this.lotRepo.find({ where, relations: ['sku'] });
+  async findAllLots(user: any, skuId?: string): Promise<InventoryLot[]> {
+    const storeId = this.resolveStoreScope(user);
+    const qb = this.lotRepo
+      .createQueryBuilder('lot')
+      .leftJoinAndSelect('lot.sku', 'sku')
+      .leftJoin('sku.product', 'product');
+
+    if (skuId) qb.andWhere('lot.sku_id = :skuId', { skuId });
+    if (storeId) qb.andWhere('product.store_id = :storeId', { storeId });
+
+    return qb.getMany();
   }
 
-  async findLotById(id: string): Promise<InventoryLot> {
-    const lot = await this.lotRepo.findOne({ where: { id }, relations: ['sku'] });
+  async findLotById(id: string, user?: any): Promise<InventoryLot> {
+    const storeId = this.resolveStoreScope(user);
+    const qb = this.lotRepo
+      .createQueryBuilder('lot')
+      .leftJoinAndSelect('lot.sku', 'sku')
+      .leftJoin('sku.product', 'product')
+      .where('lot.id = :id', { id });
+
+    if (storeId) qb.andWhere('product.store_id = :storeId', { storeId });
+
+    const lot = await qb.getOne();
     if (!lot) throw new NotFoundException(`Lot ${id} not found`);
     return lot;
   }
@@ -53,8 +101,9 @@ export class InventoryService {
   async updateLot(
     id: string,
     updates: Partial<Pick<InventoryLot, 'batch_code' | 'expiration_date' | 'quantity'>>,
+    user: any,
   ): Promise<InventoryLot> {
-    const lot = await this.findLotById(id);
+    const lot = await this.findLotById(id, user);
     Object.assign(lot, updates);
     return this.lotRepo.save(lot);
   }
@@ -64,15 +113,19 @@ export class InventoryService {
   async adjustStock(
     dto: AdjustStockDto,
     userId: string,
+    user: any,
   ): Promise<{ adjustment: InventoryAdjustment; alreadyExisted: boolean }> {
+    this.resolveStoreScope(user);
+
     const existing = await this.adjustmentRepo.findOne({
       where: { idempotency_key: dto.idempotencyKey },
     });
     if (existing) {
+      await this.findLotById(existing.lot_id, user);
       return { adjustment: existing, alreadyExisted: true };
     }
 
-    const lot = await this.findLotById(dto.lotId);
+    const lot = await this.findLotById(dto.lotId, user);
     lot.quantity += dto.delta;
     await this.lotRepo.save(lot);
 

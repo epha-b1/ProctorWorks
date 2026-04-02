@@ -26,13 +26,17 @@ import { CreateBrandDto } from './dto/create-brand.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Products')
 @ApiBearerAuth()
 @Controller()
 @UseGuards(RolesGuard)
 export class ProductsController {
-  constructor(private readonly productsService: ProductsService) {}
+  constructor(
+    private readonly productsService: ProductsService,
+    private readonly auditService: AuditService,
+  ) {}
 
   /* ── Products ── */
 
@@ -40,8 +44,10 @@ export class ProductsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a product' })
   @ApiResponse({ status: 201, description: 'Product created' })
-  createProduct(@Body() dto: CreateProductDto, @CurrentUser() user: any) {
-    return this.productsService.createProduct(dto, user);
+  async createProduct(@Body() dto: CreateProductDto, @CurrentUser() user: any) {
+    const product = await this.productsService.createProduct(dto, user);
+    await this.auditService.log(user.id, 'create_product', 'product', product.id);
+    return product;
   }
 
   @Get('products')
@@ -74,7 +80,12 @@ export class ProductsController {
     @Body() dto: UpdateProductDto,
     @CurrentUser() user: any,
   ) {
-    return this.productsService.updateProduct(id, dto, user);
+    return this.productsService.updateProduct(id, dto, user).then(async (product) => {
+      await this.auditService.log(user.id, 'update_product', 'product', id, {
+        fields: Object.keys(dto || {}),
+      });
+      return product;
+    });
   }
 
   @Delete('products/:id')
@@ -86,7 +97,10 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
   ) {
-    return this.productsService.deleteProduct(id, user);
+    return this.productsService.deleteProduct(id, user).then(async (result) => {
+      await this.auditService.log(user.id, 'delete_product', 'product', id);
+      return result;
+    });
   }
 
   @Post('products/:id/publish')
@@ -98,7 +112,10 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
   ) {
-    return this.productsService.publishProduct(id, user);
+    return this.productsService.publishProduct(id, user).then(async (product) => {
+      await this.auditService.log(user.id, 'publish_product', 'product', id);
+      return product;
+    });
   }
 
   @Post('products/:id/unpublish')
@@ -110,7 +127,10 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
   ) {
-    return this.productsService.unpublishProduct(id, user);
+    return this.productsService.unpublishProduct(id, user).then(async (product) => {
+      await this.auditService.log(user.id, 'unpublish_product', 'product', id);
+      return product;
+    });
   }
 
   /* ── SKUs ── */
@@ -137,7 +157,12 @@ export class ProductsController {
     @Body() dto: CreateSkuDto,
     @CurrentUser() user: any,
   ) {
-    return this.productsService.createSku(id, dto, user);
+    return this.productsService.createSku(id, dto, user).then(async (sku) => {
+      await this.auditService.log(user.id, 'create_sku', 'sku', sku.id, {
+        productId: id,
+      });
+      return sku;
+    });
   }
 
   @Patch('skus/:id')
@@ -150,7 +175,12 @@ export class ProductsController {
     @Body() dto: UpdateSkuDto,
     @CurrentUser() user: any,
   ) {
-    return this.productsService.updateSku(id, dto, user);
+    return this.productsService.updateSku(id, dto, user).then(async (sku) => {
+      await this.auditService.log(user.id, 'update_sku', 'sku', id, {
+        fields: Object.keys(dto || {}),
+      });
+      return sku;
+    });
   }
 
   @Delete('skus/:id')
@@ -162,7 +192,10 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
   ) {
-    return this.productsService.deleteSku(id, user);
+    return this.productsService.deleteSku(id, user).then(async (result) => {
+      await this.auditService.log(user.id, 'delete_sku', 'sku', id);
+      return result;
+    });
   }
 
   /* ── Categories ── */
@@ -178,8 +211,13 @@ export class ProductsController {
   @Roles('platform_admin')
   @ApiOperation({ summary: 'Create a category' })
   @ApiResponse({ status: 201, description: 'Category created' })
-  createCategory(@Body() dto: CreateCategoryDto) {
-    return this.productsService.createCategory(dto);
+  async createCategory(
+    @Body() dto: CreateCategoryDto,
+    @CurrentUser('id') actorId: string,
+  ) {
+    const category = await this.productsService.createCategory(dto);
+    await this.auditService.log(actorId, 'create_category', 'category', category.id);
+    return category;
   }
 
   /* ── Brands ── */
@@ -195,7 +233,12 @@ export class ProductsController {
   @Roles('platform_admin')
   @ApiOperation({ summary: 'Create a brand' })
   @ApiResponse({ status: 201, description: 'Brand created' })
-  createBrand(@Body() dto: CreateBrandDto) {
-    return this.productsService.createBrand(dto);
+  async createBrand(
+    @Body() dto: CreateBrandDto,
+    @CurrentUser('id') actorId: string,
+  ) {
+    const brand = await this.productsService.createBrand(dto);
+    await this.auditService.log(actorId, 'create_brand', 'brand', brand.id);
+    return brand;
   }
 }

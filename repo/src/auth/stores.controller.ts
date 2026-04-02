@@ -24,6 +24,8 @@ import { IsNotEmpty, IsString, IsOptional } from 'class-validator';
 import { Store } from './entities/store.entity';
 import { Roles } from '../common/decorators/roles.decorator';
 import { UserRole } from './entities/user.entity';
+import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { AuditService } from '../audit/audit.service';
 
 export class CreateStoreDto {
   @ApiProperty({ example: 'Downtown Branch' })
@@ -46,6 +48,7 @@ export class StoresController {
   constructor(
     @InjectRepository(Store)
     private readonly storeRepository: Repository<Store>,
+    private readonly auditService: AuditService,
   ) {}
 
   @Get()
@@ -60,9 +63,13 @@ export class StoresController {
   @Roles(UserRole.PLATFORM_ADMIN)
   @ApiOperation({ summary: 'Create a store (platform_admin only)' })
   @ApiResponse({ status: 201, description: 'Store created' })
-  create(@Body() dto: CreateStoreDto) {
+  async create(@Body() dto: CreateStoreDto, @CurrentUser('id') actorId: string) {
     const store = this.storeRepository.create({ name: dto.name });
-    return this.storeRepository.save(store);
+    const saved = await this.storeRepository.save(store);
+    await this.auditService.log(actorId, 'create_store', 'store', saved.id, {
+      name: saved.name,
+    });
+    return saved;
   }
 
   @Patch(':id')
@@ -73,6 +80,7 @@ export class StoresController {
   async update(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateStoreDto,
+    @CurrentUser('id') actorId: string,
   ) {
     const store = await this.storeRepository.findOne({ where: { id } });
     if (!store) {
@@ -81,7 +89,11 @@ export class StoresController {
     if (dto.name !== undefined) {
       store.name = dto.name;
     }
-    return this.storeRepository.save(store);
+    const saved = await this.storeRepository.save(store);
+    await this.auditService.log(actorId, 'update_store', 'store', id, {
+      fields: Object.keys(dto || {}),
+    });
+    return saved;
   }
 
   @Delete(':id')
@@ -90,11 +102,15 @@ export class StoresController {
   @ApiOperation({ summary: 'Delete a store (platform_admin only)' })
   @ApiResponse({ status: 204, description: 'Store deleted' })
   @ApiResponse({ status: 404, description: 'Store not found' })
-  async remove(@Param('id', ParseUUIDPipe) id: string) {
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser('id') actorId: string,
+  ) {
     const store = await this.storeRepository.findOne({ where: { id } });
     if (!store) {
       throw new NotFoundException('Store not found');
     }
     await this.storeRepository.remove(store);
+    await this.auditService.log(actorId, 'delete_store', 'store', id);
   }
 }
