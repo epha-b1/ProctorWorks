@@ -124,6 +124,26 @@ describe('Security & Authorization', () => {
   // ── Promotions store isolation ─────────────────────────────────────────
   describe('Promotions store isolation', () => {
     it('store_admin list shows only their store promotions', async () => {
+      const me = await request(server)
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${storeAdminToken}`);
+      expect([200, 201]).toContain(me.status);
+      const storeId = me.body.storeId;
+      expect(storeId).toBeDefined();
+
+      // Store admin creates an owned promotion (controller assigns storeId)
+      const owned = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${storeAdminToken}`)
+        .send({
+          name: `OwnedPromo${U}`,
+          type: 'percentage',
+          priority: 120,
+          discountType: 'percentage',
+          discountValue: 7,
+        });
+      expect(owned.status).toBe(201);
+
       // Admin creates promotion without store_id
       await request(server).post('/promotions').set('Authorization', `Bearer ${adminToken}`)
         .send({ name: `GlobalPromo${U}`, type: 'percentage', priority: 100, discountType: 'percentage', discountValue: 5 });
@@ -131,11 +151,12 @@ describe('Security & Authorization', () => {
       const res = await request(server).get('/promotions').set('Authorization', `Bearer ${storeAdminToken}`);
       logStep('GET', 'promotions', res.status);
       expect([200, 201]).toContain(res.status);
-      // store_admin should only see promotions matching their store
+
+      const ids = res.body.map((p: any) => p.id);
+      expect(ids).toContain(owned.body.id);
+      expect(res.body.length).toBeGreaterThan(0);
       for (const p of res.body) {
-        if (p.store_id) {
-          // JWT storeId should match — can't verify exact ID here but at minimum no global promos
-        }
+        expect(p.store_id).toBe(storeId);
       }
     });
 

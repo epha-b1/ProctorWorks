@@ -65,6 +65,14 @@ describe('OrdersService', () => {
   let skuRepo: ReturnType<typeof makeMockRepo>;
   let dataSource: ReturnType<typeof makeMockDataSource>;
   let manager: ReturnType<typeof makeMockManager>;
+  let encryptionService: {
+    encrypt: jest.Mock;
+    decrypt: jest.Mock;
+    isEncrypted: jest.Mock;
+  };
+  let promotionsService: {
+    resolvePromotions: jest.Mock;
+  };
 
   beforeEach(() => {
     orderRepo = makeMockRepo();
@@ -73,6 +81,18 @@ describe('OrdersService', () => {
     skuRepo = makeMockRepo();
     manager = makeMockManager();
     dataSource = makeMockDataSource(manager);
+    encryptionService = {
+      encrypt: jest.fn((value: string) => `enc:${value}`),
+      decrypt: jest.fn((value: string) => value.replace(/^enc:/, '')),
+      isEncrypted: jest.fn((value: string) => value.startsWith('enc:')),
+    };
+    promotionsService = {
+      resolvePromotions: jest.fn().mockResolvedValue({
+        selectedPromotion: null,
+        selectedCoupon: null,
+        totalDiscount: 0,
+      }),
+    };
 
     service = new OrdersService(
       orderRepo as any,
@@ -80,6 +100,8 @@ describe('OrdersService', () => {
       idempotencyRepo as any,
       skuRepo as any,
       dataSource as any,
+      encryptionService as any,
+      promotionsService as any,
     );
   });
 
@@ -151,6 +173,51 @@ describe('OrdersService', () => {
       expect(result.order).toBe(existingOrder);
       // Transaction should NOT have been invoked
       expect(dataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    it('applies resolved promotion and coupon discount to totals', async () => {
+      idempotencyRepo.findOne.mockResolvedValue(null);
+
+      const skuA = { id: 'sku-a', price_cents: 1000, member_price_cents: null };
+      const qb = {
+        whereInIds: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([skuA]),
+      };
+      skuRepo.createQueryBuilder.mockReturnValue(qb);
+
+      promotionsService.resolvePromotions.mockResolvedValue({
+        selectedPromotion: { id: 'promo-1' },
+        selectedCoupon: { id: 'coupon-1' },
+        totalDiscount: 250,
+      });
+
+      manager.findOne.mockResolvedValue(buildOrder({ total_cents: 750 }));
+
+      await service.createOrder(
+        {
+          idempotencyKey: 'promo-key',
+          couponCode: 'SAVE10',
+          items: [{ skuId: 'sku-a', quantity: 1 }],
+        },
+        storeAdminUser,
+      );
+
+      const orderCreateCall = manager.create.mock.calls.find(
+        ([entity]: any) => entity === Order,
+      );
+
+      expect(promotionsService.resolvePromotions).toHaveBeenCalledWith(
+        1000,
+        'user-1',
+        'store-1',
+        'SAVE10',
+      );
+      expect(orderCreateCall![1]).toMatchObject({
+        total_cents: 750,
+        discount_cents: 250,
+        promotion_id: 'promo-1',
+        coupon_id: 'coupon-1',
+      });
     });
   });
 

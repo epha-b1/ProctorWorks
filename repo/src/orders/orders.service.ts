@@ -14,6 +14,7 @@ import { IdempotencyKey } from './entities/idempotency-key.entity';
 import { Sku } from '../products/entities/sku.entity';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { EncryptionService } from '../common/encryption.service';
+import { PromotionsService } from '../promotions/promotions.service';
 
 @Injectable()
 export class OrdersService {
@@ -28,14 +29,20 @@ export class OrdersService {
     private readonly skuRepo: Repository<Sku>,
     private readonly dataSource: DataSource,
     private readonly encryptionService: EncryptionService,
+    private readonly promotionsService: PromotionsService,
   ) {}
+
+  private getUserStoreId(user: any): string | null {
+    return user?.storeId ?? user?.store_id ?? null;
+  }
 
   private enforceStoreScope(user: any): string | null {
     if (user.role === 'store_admin') {
-      if (!user.store_id) {
+      const storeId = this.getUserStoreId(user);
+      if (!storeId) {
         throw new ForbiddenException('Store admin has no assigned store');
       }
-      return user.store_id;
+      return storeId;
     }
     return null;
   }
@@ -87,11 +94,25 @@ export class OrdersService {
       });
     }
 
-    // 3. Promotions/coupons placeholder (Slice 8)
-    const discountCents = 0;
-    const totalCents = subtotalCents - discountCents;
+    // 3. Resolve promotions/coupons (max one auto + one coupon)
+    const storeId = this.enforceStoreScope(user) || this.getUserStoreId(user);
+    let discountCents = 0;
+    let promotionId: string | null = null;
+    let couponId: string | null = null;
 
-    const storeId = this.enforceStoreScope(user) || user.store_id;
+    if (storeId) {
+      const resolved = await this.promotionsService.resolvePromotions(
+        subtotalCents,
+        user.id,
+        storeId,
+        dto.couponCode,
+      );
+      discountCents = resolved.totalDiscount;
+      promotionId = resolved.selectedPromotion?.id || null;
+      couponId = resolved.selectedCoupon?.id || null;
+    }
+
+    const totalCents = Math.max(0, subtotalCents - discountCents);
 
     // Encrypt internal notes if provided
     const encryptedNotes = dto.internalNotes
@@ -106,6 +127,8 @@ export class OrdersService {
         idempotency_key: dto.idempotencyKey,
         total_cents: totalCents,
         discount_cents: discountCents,
+        coupon_id: couponId,
+        promotion_id: promotionId,
         internal_notes: encryptedNotes,
         status: OrderStatus.PENDING,
       });

@@ -36,12 +36,17 @@ export class ProductsService {
 
   /* ── helpers ── */
 
+  private getUserStoreId(user: any): string | null {
+    return user?.storeId ?? user?.store_id ?? null;
+  }
+
   private enforceStoreScope(user: any): string {
     if (user.role === 'store_admin') {
-      if (!user.store_id) {
+      const storeId = this.getUserStoreId(user);
+      if (!storeId) {
         throw new ForbiddenException('Store admin has no assigned store');
       }
-      return user.store_id;
+      return storeId;
     }
     return null;
   }
@@ -67,7 +72,7 @@ export class ProductsService {
       name: dto.name,
       category_id: dto.categoryId,
       brand_id: dto.brandId,
-      store_id: storeId || user.store_id,
+      store_id: storeId || this.getUserStoreId(user),
     });
     return this.productRepo.save(product);
   }
@@ -106,10 +111,11 @@ export class ProductsService {
     if (!product) throw new NotFoundException(`Product ${id} not found`);
 
     if (user.role === 'store_admin') {
-      if (!user.store_id) {
+      const storeId = this.getUserStoreId(user);
+      if (!storeId) {
         throw new ForbiddenException('Store admin has no assigned store');
       }
-      if (product.store_id !== user.store_id) {
+      if (product.store_id !== storeId) {
         throw new ForbiddenException('Access denied to this product');
       }
       product.status = ProductStatus.PENDING_REVIEW;
