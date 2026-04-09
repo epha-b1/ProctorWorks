@@ -138,4 +138,227 @@ describe('Orders API', () => {
     logStep('POST', '/orders', res.status);
     expect(res.status).toBe(400);
   });
+
+  // ──────────────────────────────────────────────────────────────────
+  // HIGH-1 — Order idempotency must be scoped, not globally unique.
+  //
+  // The InitialSchema migration installed a UNIQUE constraint on
+  // `orders.idempotency_key`. That contract is now broken on purpose
+  // by `1711900000004-DropOrdersIdempotencyKeyUnique`, so this block
+  // proves both halves of the new contract end-to-end:
+  //
+  //   1. Schema-level: the global UNIQUE constraint is GONE. We
+  //      verify by inserting two distinct order rows that share the
+  //      same `idempotency_key` directly via the live DataSource —
+  //      this would have raised SQLSTATE 23505 on the old schema.
+  //
+  //   2. Service-level: the same idempotency key reused by two
+  //      different (store, actor) tuples produces two distinct
+  //      orders. Reusing the key inside the SAME (store, actor)
+  //      tuple still dedupes back to the original order.
+  //
+  // The full multi-tenant HTTP path is also covered by
+  // `remediation.api.spec.ts:687`; this block keeps the schema-level
+  // assertion close to the orders test surface so the contract is
+  // visible alongside the rest of the order-level idempotency tests.
+  // ──────────────────────────────────────────────────────────────────
+  describe('HIGH-1: order idempotency scoping vs schema uniqueness', () => {
+    let dataSource: any;
+    let crossA: any;
+    let crossB: any;
+    let crossSkuA: string;
+    let crossSkuB: string;
+    let crossAdminAId: string;
+    let crossAdminBId: string;
+    let crossAdminAToken: string;
+    let crossAdminBToken: string;
+
+    beforeAll(async () => {
+      const { DataSource } = require('typeorm');
+      dataSource = (app as any).get(DataSource);
+
+      // Disposable stores + store_admins so this block can run
+      // independently from the cross-tenant block in remediation.api.
+      crossA = (
+        await request(server)
+          .post('/stores')
+          .set('Authorization', `Bearer ${token}`)
+          .send({ name: `OrdHigh1A-${U}` })
+      ).body;
+      crossB = (
+        await request(server)
+          .post('/stores')
+          .set('Authorization', `Bearer ${token}`)
+          .send({ name: `OrdHigh1B-${U}` })
+      ).body;
+
+      const userA = await request(server)
+        .post('/users')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          username: `ordhigh1a${U}`,
+          password: 'Admin1234!',
+          role: 'store_admin',
+          storeId: crossA.id,
+        });
+      crossAdminAId = userA.body.id;
+      const userB = await request(server)
+        .post('/users')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          username: `ordhigh1b${U}`,
+          password: 'Admin1234!',
+          role: 'store_admin',
+          storeId: crossB.id,
+        });
+      crossAdminBId = userB.body.id;
+
+      crossAdminAToken = await login(server, `ordhigh1a${U}`, 'Admin1234!');
+      crossAdminBToken = await login(server, `ordhigh1b${U}`, 'Admin1234!');
+
+      // Each store needs at least one SKU so its admin can place an
+      // order. Distinct prices so any cross-tenant leak shows up
+      // immediately in the order total.
+      const cat = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: `OrdHigh1Cat-${U}` });
+      const brand = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: `OrdHigh1Brand-${U}` });
+
+      const prodA = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${crossAdminAToken}`)
+        .send({
+          name: `OrdHigh1ProdA-${U}`,
+          categoryId: cat.body.id,
+          brandId: brand.body.id,
+        });
+      const sA = await request(server)
+        .post(`/products/${prodA.body.id}/skus`)
+        .set('Authorization', `Bearer ${crossAdminAToken}`)
+        .send({ skuCode: `H1-A-${U}`, priceCents: 5_555 });
+      crossSkuA = sA.body.id;
+
+      const prodB = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${crossAdminBToken}`)
+        .send({
+          name: `OrdHigh1ProdB-${U}`,
+          categoryId: cat.body.id,
+          brandId: brand.body.id,
+        });
+      const sB = await request(server)
+        .post(`/products/${prodB.body.id}/skus`)
+        .set('Authorization', `Bearer ${crossAdminBToken}`)
+        .send({ skuCode: `H1-B-${U}`, priceCents: 9_999 });
+      crossSkuB = sB.body.id;
+    }, 60_000);
+
+    it('schema: orders.idempotency_key has NO global UNIQUE / UNIQUE INDEX', async () => {
+      // Postgres metadata check: there must be ZERO unique constraints
+      // or unique indexes covering only `idempotency_key` on `orders`.
+      // The InitialSchema migration would have failed this with
+      // `UQ_orders_idempotency_key`; the new
+      // 1711900000004-DropOrdersIdempotencyKeyUnique migration drops it.
+      const uniqueRows = await dataSource.query(
+        `
+        SELECT i.relname AS index_name, ix.indisunique AS is_unique
+        FROM pg_class t
+        JOIN pg_index ix ON t.oid = ix.indrelid
+        JOIN pg_class i ON i.oid = ix.indexrelid
+        JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
+        WHERE t.relname = 'orders'
+          AND a.attname = 'idempotency_key'
+          AND ix.indisunique = true
+          AND array_length(ix.indkey, 1) = 1
+        `,
+      );
+      expect(uniqueRows).toHaveLength(0);
+    });
+
+    it('schema: two orders with the SAME idempotency_key are insertable', async () => {
+      // Direct DB insert of two `orders` rows that share the same
+      // `idempotency_key` but live in different stores. Under the
+      // legacy global UNIQUE this would raise SQLSTATE 23505. Under
+      // the scoped design this MUST succeed.
+      const sharedKey = `schema-shared-${U}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+
+      await dataSource.query(
+        `
+        INSERT INTO "orders"
+          ("store_id", "user_id", "status", "idempotency_key", "total_cents")
+        VALUES
+          ($1, $2, 'pending', $5, 100),
+          ($3, $4, 'pending', $5, 100)
+        `,
+        [crossA.id, crossAdminAId, crossB.id, crossAdminBId, sharedKey],
+      );
+
+      const rows = await dataSource.query(
+        `SELECT id, store_id FROM "orders" WHERE "idempotency_key" = $1`,
+        [sharedKey],
+      );
+      expect(rows).toHaveLength(2);
+      const storeIds = rows.map((r: any) => r.store_id).sort();
+      expect(storeIds).toEqual([crossA.id, crossB.id].sort());
+
+      // Cleanup so other tests are isolated.
+      await dataSource.query(
+        `DELETE FROM "orders" WHERE "idempotency_key" = $1`,
+        [sharedKey],
+      );
+    });
+
+    it('service: same key in two stores → two distinct orders, same scope still dedupes', async () => {
+      const sharedKey = `service-shared-${U}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`;
+
+      // (1) store A creates an order with the key.
+      const aRes = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${crossAdminAToken}`)
+        .send({
+          idempotencyKey: sharedKey,
+          items: [{ skuId: crossSkuA, quantity: 1 }],
+        });
+      expect(aRes.status).toBe(201);
+      expect(aRes.body.store_id).toBe(crossA.id);
+      expect(aRes.body.total_cents).toBe(5_555);
+      const orderAId = aRes.body.id;
+
+      // (2) store B reuses the EXACT same key → must NOT collide on
+      //     the legacy UQ_orders_idempotency_key, must NOT serve
+      //     store A's order through the scoped lookup.
+      const bRes = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${crossAdminBToken}`)
+        .send({
+          idempotencyKey: sharedKey,
+          items: [{ skuId: crossSkuB, quantity: 1 }],
+        });
+      expect(bRes.status).toBe(201);
+      expect(bRes.body.store_id).toBe(crossB.id);
+      expect(bRes.body.total_cents).toBe(9_999);
+      expect(bRes.body.id).not.toBe(orderAId);
+
+      // (3) same-scope replay still dedupes (regression guard for the
+      //     happy path that was already covered by the line-57 test).
+      const aReplay = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${crossAdminAToken}`)
+        .send({
+          idempotencyKey: sharedKey,
+          items: [{ skuId: crossSkuA, quantity: 1 }],
+        });
+      expect([200, 201]).toContain(aReplay.status);
+      expect(aReplay.body.id).toBe(orderAId);
+      expect(aReplay.body.store_id).toBe(crossA.id);
+    });
+  });
 });

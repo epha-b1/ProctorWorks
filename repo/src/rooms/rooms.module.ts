@@ -7,10 +7,20 @@ import { SeatMapVersion } from './entities/seat-map-version.entity';
 import { RoomsService } from './rooms.service';
 import { RoomsController } from './rooms.controller';
 import { AuditModule } from '../audit/audit.module';
+import { Reservation } from '../reservations/entities/reservation.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([StudyRoom, Zone, Seat, SeatMapVersion]),
+    TypeOrmModule.forFeature([
+      StudyRoom,
+      Zone,
+      Seat,
+      SeatMapVersion,
+      // Registered here so the seat-status update transaction can
+      // cancel active holds in a single atomic write when a seat is
+      // transitioned to maintenance.
+      Reservation,
+    ]),
     AuditModule,
   ],
   controllers: [RoomsController],

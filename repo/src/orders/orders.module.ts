@@ -8,10 +8,12 @@ import { OrdersService } from './orders.service';
 import { OrdersController } from './orders.controller';
 import { EncryptionService } from '../common/encryption.service';
 import { PromotionsModule } from '../promotions/promotions.module';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
     PromotionsModule,
+    AuditModule,
     TypeOrmModule.forFeature([Order, OrderItem, IdempotencyKey, Sku]),
   ],
   controllers: [OrdersController],

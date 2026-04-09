@@ -5,6 +5,7 @@ import {
   CreateDateColumn,
   UpdateDateColumn,
   OneToMany,
+  Index,
 } from 'typeorm';
 import { OrderItem } from './order-item.entity';
 
@@ -16,6 +17,14 @@ export enum OrderStatus {
 }
 
 @Entity('orders')
+// audit_report-1 §5.4 / HIGH-1 — `idempotency_key` is intentionally
+// NOT globally unique anymore. The same opaque key can legitimately
+// exist for two different (store, actor) tuples, and uniqueness is
+// enforced one level up by the composite UNIQUE INDEX on
+// `idempotency_keys (operation_type, actor_id, store_id, key)`.
+// Keep a non-unique index for the lookup path; the global UNIQUE
+// constraint is dropped in migration `1711900000004-DropOrdersIdempotencyKeyUnique`.
+@Index('IDX_orders_idempotency_key', ['idempotency_key'])
 export class Order {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -33,7 +42,7 @@ export class Order {
   })
   status: OrderStatus;
 
-  @Column({ unique: true })
+  @Column()
   idempotency_key: string;
 
   @Column({ type: 'int' })

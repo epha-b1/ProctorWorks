@@ -8,6 +8,7 @@ import { Attempt } from './entities/attempt.entity';
 import { AttemptAnswer } from './entities/attempt-answer.entity';
 import { Question } from '../questions/entities/question.entity';
 import { QuestionOption } from '../questions/entities/question-option.entity';
+import { AuditModule } from '../audit/audit.module';
 
 @Module({
   imports: [
@@ -19,6 +20,7 @@ import { QuestionOption } from '../questions/entities/question-option.entity';
       Question,
       QuestionOption,
     ]),
+    AuditModule,
   ],
   controllers: [AssessmentsController],
   providers: [AssessmentsService],

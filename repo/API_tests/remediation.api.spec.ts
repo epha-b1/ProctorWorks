@@ -1100,4 +1100,295 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
       expect(blocked.status).toBe(401);
     });
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // HIGH-2: auditor cannot mutate coupon state via /coupons/:code/claim
+  //
+  // The previous controller wired `claimCoupon` with no @Roles decorator
+  // at all, so the RolesGuard returned `true` for any authenticated
+  // caller — including the read-only `auditor` role. Claiming is a
+  // write op (decrements `remaining_quantity`, may flip the coupon to
+  // EXHAUSTED, and creates a CouponClaim row), so it is now restricted
+  // to the same write roles as the rest of the coupon write surfaces.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('HIGH-2: auditor cannot claim coupons', () => {
+    let claimCouponCode: string;
+
+    beforeAll(async () => {
+      // Create a tiny promotion + coupon as platform_admin so we have
+      // a real, ACTIVE coupon to attempt the claim against.
+      const promo = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeA.id,
+          name: `H2Promo-${U}`,
+          type: 'percentage',
+          priority: 10,
+          discountType: 'percentage',
+          discountValue: 10,
+        });
+      claimCouponCode = `H2-${U}`;
+      await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeA.id,
+          code: claimCouponCode,
+          promotionId: promo.body.id,
+          remainingQuantity: 5,
+        });
+    }, 30_000);
+
+    it('auditor POST /coupons/:code/claim → 403 (no state mutation)', async () => {
+      const before = await request(server)
+        .get('/coupons')
+        .set('Authorization', `Bearer ${adminToken}`);
+      const beforeRow = before.body.find((c: any) => c.code === claimCouponCode);
+      const beforeQty = beforeRow.remaining_quantity;
+
+      const res = await request(server)
+        .post(`/coupons/${claimCouponCode}/claim`)
+        .set('Authorization', `Bearer ${auditorToken}`);
+      expect(res.status).toBe(403);
+
+      // Defense-in-depth: verify the underlying state was not mutated
+      // even though the request was rejected.
+      const after = await request(server)
+        .get('/coupons')
+        .set('Authorization', `Bearer ${adminToken}`);
+      const afterRow = after.body.find((c: any) => c.code === claimCouponCode);
+      expect(afterRow.remaining_quantity).toBe(beforeQty);
+      expect(afterRow.status).toBe('active');
+    });
+
+    it('store_admin POST /coupons/:code/claim → 200/201 (positive control)', async () => {
+      // Same endpoint, allowed role. Confirms the @Roles tightening
+      // doesn't accidentally block the legitimate write path.
+      const res = await request(server)
+        .post(`/coupons/${claimCouponCode}/claim`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`);
+      expect([200, 201]).toContain(res.status);
+      expect(res.body.coupon_id).toBeDefined();
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // HIGH-3: audit log coverage for orders / reservations / questions /
+  // assessments admin write actions.
+  //
+  // The fix wires AuditService.log(...) into the controllers for these
+  // four modules. These tests exercise a representative write op on
+  // each module and then assert via /audit-logs that the entry landed
+  // with consistent action naming, the correct actor, the resource id,
+  // and a non-empty trace id.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('HIGH-3: admin-action audit logging coverage', () => {
+    type LogPredicate = (log: any) => boolean;
+    const recentLogs = async (action: string): Promise<any[]> => {
+      const res = await request(server)
+        .get(`/audit-logs?action=${encodeURIComponent(action)}&limit=50`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(res.status).toBe(200);
+      return res.body?.data ?? [];
+    };
+    const findLog = async (
+      action: string,
+      pred: LogPredicate,
+    ): Promise<any> => {
+      const logs = await recentLogs(action);
+      return logs.find(pred);
+    };
+
+    it('orders: create_order → audit log written with actor + resource id', async () => {
+      // Need at least one SKU in store A so the order POST is valid.
+      const cat = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `H3OrdCat-${U}` });
+      const brand = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `H3OrdBrand-${U}` });
+      const prod = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          name: `H3OrdProd-${U}`,
+          categoryId: cat.body.id,
+          brandId: brand.body.id,
+        });
+      const sku = await request(server)
+        .post(`/products/${prod.body.id}/skus`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({ skuCode: `H3-ORD-${U}`, priceCents: 1234 });
+
+      const created = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          idempotencyKey: `h3-create-order-${U}`,
+          items: [{ skuId: sku.body.id, quantity: 1 }],
+        });
+      expect(created.status).toBe(201);
+      const orderId = created.body.id;
+
+      const log = await findLog(
+        'create_order',
+        (l) =>
+          l.resource_id === orderId &&
+          l.resource_type === 'order',
+      );
+      expect(log).toBeDefined();
+      expect(log.actor_id).toBeDefined();
+      expect(log.trace_id).toBeTruthy();
+    });
+
+    it('reservations: create_reservation_hold → audit log written', async () => {
+      // Seed a room → zone → seat so we have something to hold.
+      const room = await request(server)
+        .post('/rooms')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `H3Room-${U}` });
+      const zone = await request(server)
+        .post(`/rooms/${room.body.id}/zones`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `H3Zone-${U}` });
+      const seat = await request(server)
+        .post(`/zones/${zone.body.id}/seats`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ label: `H3Seat-${U}` });
+
+      const hold = await request(server)
+        .post('/reservations')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ seatId: seat.body.id });
+      expect(hold.status).toBe(201);
+
+      const log = await findLog(
+        'create_reservation_hold',
+        (l) =>
+          l.resource_id === hold.body.id &&
+          l.resource_type === 'reservation',
+      );
+      expect(log).toBeDefined();
+      expect(log.actor_id).toBeDefined();
+      expect(log.trace_id).toBeTruthy();
+    });
+
+    it('questions: create_question → audit log written', async () => {
+      const q = await request(server)
+        .post('/questions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          type: 'subjective',
+          body: `H3Q-${U}`,
+        });
+      expect(q.status).toBe(201);
+
+      const log = await findLog(
+        'create_question',
+        (l) =>
+          l.resource_id === q.body.id &&
+          l.resource_type === 'question',
+      );
+      expect(log).toBeDefined();
+      expect(log.actor_id).toBeDefined();
+      expect(log.trace_id).toBeTruthy();
+    });
+
+    it('assessments: generate_paper → audit log written', async () => {
+      // Need at least one approved question to generate a paper from.
+      const q = await request(server)
+        .post('/questions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          type: 'objective',
+          body: `H3PapQ-${U}`,
+          options: [
+            { body: 'a', isCorrect: true },
+            { body: 'b', isCorrect: false },
+          ],
+        });
+      await request(server)
+        .post(`/questions/${q.body.id}/approve`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      const paper = await request(server)
+        .post('/papers')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: `H3Paper-${U}`,
+          generationRule: { type: 'random', count: 1 },
+        });
+      expect(paper.status).toBe(201);
+
+      const log = await findLog(
+        'generate_paper',
+        (l) =>
+          l.resource_id === paper.body.id &&
+          l.resource_type === 'paper',
+      );
+      expect(log).toBeDefined();
+      expect(log.actor_id).toBeDefined();
+      expect(log.trace_id).toBeTruthy();
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // MED: seat maintenance transition cancels active holds
+  //
+  // When a seat is moved to status='maintenance', any HOLD reservations
+  // for that seat must be cancelled in the same transaction so the
+  // hold cannot be confirmed against an unusable seat.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('MED: seat → maintenance cancels active holds', () => {
+    it('hold becomes non-confirmable after seat moves to maintenance', async () => {
+      // Seed room → zone → seat; create a hold; flip seat to
+      // maintenance; assert the hold is no longer confirmable.
+      const room = await request(server)
+        .post('/rooms')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `MaintRoom-${U}` });
+      const zone = await request(server)
+        .post(`/rooms/${room.body.id}/zones`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `MaintZone-${U}` });
+      const seat = await request(server)
+        .post(`/zones/${zone.body.id}/seats`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ label: `MaintSeat-${U}` });
+
+      const hold = await request(server)
+        .post('/reservations')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ seatId: seat.body.id });
+      expect(hold.status).toBe(201);
+      expect(hold.body.status).toBe('hold');
+
+      // Flip seat to maintenance via the seat update endpoint. This
+      // is the trigger that should cascade-cancel the hold.
+      const upd = await request(server)
+        .patch(`/seats/${seat.body.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'maintenance' });
+      expect([200, 201]).toContain(upd.status);
+      expect(upd.body.status).toBe('maintenance');
+
+      // The hold should no longer be confirmable.
+      const confirmRes = await request(server)
+        .post(`/reservations/${hold.body.id}/confirm`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(confirmRes.status).toBe(409);
+
+      // The reservation row should be CANCELLED, not HOLD.
+      const list = await request(server)
+        .get(`/reservations?seatId=${seat.body.id}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      const row = list.body.find((r: any) => r.id === hold.body.id);
+      expect(row).toBeDefined();
+      expect(row.status).toBe('cancelled');
+      expect(row.cancelled_at).not.toBeNull();
+    });
+  });
 });

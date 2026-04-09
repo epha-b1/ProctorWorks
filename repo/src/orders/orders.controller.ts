@@ -22,13 +22,18 @@ import { CreateOrderDto } from './dto/create-order.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Orders')
 @ApiBearerAuth()
 @Controller('orders')
 @UseGuards(RolesGuard)
 export class OrdersController {
-  constructor(private readonly ordersService: OrdersService) {}
+  constructor(
+    private readonly ordersService: OrdersService,
+    private readonly auditService: AuditService,
+  ) {}
 
   @Post()
   @Roles('store_admin', 'platform_admin')
@@ -39,9 +44,23 @@ export class OrdersController {
     @Body() dto: CreateOrderDto,
     @CurrentUser() user: any,
     @Res({ passthrough: true }) res: Response,
+    @TraceId() traceId?: string,
   ) {
     const { order, alreadyExisted } = await this.ordersService.createOrder(dto, user);
     res.status(alreadyExisted ? HttpStatus.OK : HttpStatus.CREATED);
+    // HIGH-3 — only audit on the genuine create path. The dedup branch
+    // is a no-op as far as state is concerned, so logging it would
+    // pollute the audit trail with phantom "create_order" entries.
+    if (!alreadyExisted) {
+      await this.auditService.log(
+        user.id,
+        'create_order',
+        'order',
+        order.id,
+        { storeId: order.store_id, totalCents: order.total_cents },
+        traceId,
+      );
+    }
     return order;
   }
 
@@ -71,11 +90,21 @@ export class OrdersController {
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Order confirmed' })
   @ApiResponse({ status: 409, description: 'Invalid status transition' })
-  confirmOrder(
+  async confirmOrder(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
-    return this.ordersService.confirmOrder(id, user);
+    const order = await this.ordersService.confirmOrder(id, user);
+    await this.auditService.log(
+      user.id,
+      'confirm_order',
+      'order',
+      id,
+      { storeId: order.store_id },
+      traceId,
+    );
+    return order;
   }
 
   @Post(':id/fulfill')
@@ -84,11 +113,21 @@ export class OrdersController {
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Order fulfilled' })
   @ApiResponse({ status: 409, description: 'Invalid status transition' })
-  fulfillOrder(
+  async fulfillOrder(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
-    return this.ordersService.fulfillOrder(id, user);
+    const order = await this.ordersService.fulfillOrder(id, user);
+    await this.auditService.log(
+      user.id,
+      'fulfill_order',
+      'order',
+      id,
+      { storeId: order.store_id },
+      traceId,
+    );
+    return order;
   }
 
   @Post(':id/cancel')
@@ -97,10 +136,20 @@ export class OrdersController {
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Order cancelled' })
   @ApiResponse({ status: 409, description: 'Invalid status transition' })
-  cancelOrder(
+  async cancelOrder(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
-    return this.ordersService.cancelOrder(id, user);
+    const order = await this.ordersService.cancelOrder(id, user);
+    await this.auditService.log(
+      user.id,
+      'cancel_order',
+      'order',
+      id,
+      { storeId: order.store_id },
+      traceId,
+    );
+    return order;
   }
 }

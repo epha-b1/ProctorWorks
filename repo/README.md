@@ -88,7 +88,113 @@ See `.env.example` for all configurable values. Key variables:
 
 All foreign keys indexed. Additional performance indexes on:
 - `reservations.hold_until`, `reservations.status`
-- `orders.idempotency_key`, `inventory_adjustments.idempotency_key`
+- `orders.idempotency_key` (NON-UNIQUE — see "Order idempotency" below),
+  `inventory_adjustments.idempotency_key`
 - `coupons.code`, `promotions.priority`
 - `audit_logs.created_at`, `audit_logs.actor_id`, `audit_logs.action`
 - `questions.type`, `questions.status`
+
+## Order idempotency
+
+`POST /orders` is idempotent per `(operation_type, actor_id, store_id, key)`.
+Two callers in different stores can legitimately reuse the same opaque
+`idempotencyKey` and each receive their own fresh order — the previous
+schema enforced a global UNIQUE on `orders.idempotency_key` which made
+that scenario fail with a Postgres unique-violation. The fix is split
+across two migrations:
+
+- `1711900000003-ScopeIdempotencyKeys` installs the composite UNIQUE
+  index `(operation_type, actor_id, COALESCE(store_id, sentinel), key)`
+  on the `idempotency_keys` table. This is the actual deduplication
+  contract. NULL store ids are normalized to a sentinel UUID so
+  cross-store / platform-admin operations still collide deterministically.
+- `1711900000004-DropOrdersIdempotencyKeyUnique` (HIGH-1) drops the
+  legacy global UNIQUE constraint on `orders.idempotency_key` and
+  replaces it with a plain BTREE index. The migration is idempotent
+  and additionally sweeps any environment that ended up with the
+  constraint under a TypeORM-auto-generated name.
+
+The OrdersService dedup path performs the lookup against
+`idempotency_keys` and additionally verifies the resolved order's
+`store_id` and `user_id` match the caller's scope before returning, so
+even a stray legacy row cannot leak across tenants.
+
+## Audit logs
+
+Audit logs are append-only. Two BEFORE triggers (`trg_audit_logs_no_delete`
+and `trg_audit_logs_no_update`) installed by `InitialSchema1711900000000`
+raise an exception on any DELETE or UPDATE attempt at the database
+level, so a compromised application user cannot tamper with the trail
+even with table-level grants.
+
+### Coverage
+
+`AuditService.log(...)` is invoked from controllers on every admin
+write surface. Action names are stable identifiers used for filtering
+in `/audit-logs?action=...`:
+
+| Module        | Action names |
+|---------------|--------------|
+| Orders        | `create_order`, `confirm_order`, `fulfill_order`, `cancel_order` |
+| Reservations  | `create_reservation_hold`, `confirm_reservation`, `cancel_reservation` |
+| Questions     | `create_question`, `update_question`, `delete_question`, `approve_question`, `reject_question`, `bulk_import_questions`, `add_question_explanation` |
+| Assessments   | `generate_paper`, `start_attempt`, `submit_attempt`, `redo_attempt` |
+| Promotions    | `create_promotion`, `update_promotion`, `delete_promotion`, `create_coupon`, `claim_coupon`, `distribute_coupon`, `expire_coupon` |
+| Rooms         | `create_room`, `update_room`, `delete_room`, `create_zone`, `create_seat`, `update_seat`, `delete_seat`, `publish_seat_map` |
+| Products      | `create_product`, `publish_product`, `approve_product`, etc. |
+
+Every entry includes `actor_id`, `action`, `resource_type`, `resource_id`
+(when applicable), `detail`, `trace_id`, and `created_at`. The trace id
+is propagated automatically by the `TraceIdInterceptor` so log entries
+can be correlated end-to-end with request logs.
+
+### Retention strategy (7 years)
+
+Audit retention is **7 years** as documented in the `audit_logs` table
+comment installed by `InitialSchema1711900000000`. The DB-level
+immutability triggers prevent ad-hoc deletion, so retention enforcement
+must be deliberate and operator-driven rather than implicit. The
+recommended workflow on this single-host offline deployment is:
+
+1. **Cold archive once per quarter.**
+   Stream the immutable rows out via `GET /audit-logs/export` (CSV,
+   masks sensitive fields via `maskSensitiveFields`) into a tamper-
+   evident archive (encrypted volume, signed bundle, write-once
+   storage). This is the canonical long-term retention surface and
+   does not require any DB mutation.
+
+2. **Periodic integrity check.**
+   Hash the export and store the digest separately. Because the
+   underlying rows are immutable, recomputing the digest from a fresh
+   export must always produce the same value until pruning happens.
+
+3. **Pruning beyond 7 years (operator action).**
+   Pruning is an explicit operator action, never automatic. The DB
+   triggers must be temporarily lifted by a privileged migration that:
+   - drops `trg_audit_logs_no_delete`
+   - executes a single `DELETE` bounded by
+     `created_at < NOW() - INTERVAL '7 years'`
+   - re-installs the trigger
+   The migration must run inside a single transaction so the trigger
+   is never absent for more than the lifetime of the prune. Sample
+   skeleton:
+
+   ```sql
+   BEGIN;
+   DROP TRIGGER trg_audit_logs_no_delete ON audit_logs;
+   DELETE FROM audit_logs WHERE created_at < NOW() - INTERVAL '7 years';
+   CREATE TRIGGER trg_audit_logs_no_delete
+     BEFORE DELETE ON audit_logs
+     FOR EACH ROW EXECUTE FUNCTION prevent_audit_log_modification();
+   COMMIT;
+   ```
+
+   The runbook must require the cold archive from step 1 to exist
+   before pruning is approved, so any deleted rows remain recoverable
+   from the archive for the full retention window.
+
+This split — immutability enforced in code, retention enforced by an
+auditable runbook — preserves the tamper-evidence guarantee for the
+99.99% case (no automatic mutation) while still giving operators a
+documented escape hatch for the edge case where the table genuinely
+needs to be pruned.

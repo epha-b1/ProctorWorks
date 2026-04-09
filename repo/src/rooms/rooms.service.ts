@@ -4,15 +4,19 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { StudyRoom } from './entities/study-room.entity';
 import { Zone } from './entities/zone.entity';
-import { Seat } from './entities/seat.entity';
+import { Seat, SeatStatus } from './entities/seat.entity';
 import { SeatMapVersion } from './entities/seat-map-version.entity';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { CreateZoneDto } from './dto/create-zone.dto';
 import { CreateSeatDto } from './dto/create-seat.dto';
 import { UpdateSeatDto } from './dto/update-seat.dto';
+import {
+  Reservation,
+  ReservationStatus,
+} from '../reservations/entities/reservation.entity';
 
 @Injectable()
 export class RoomsService {
@@ -25,6 +29,7 @@ export class RoomsService {
     private readonly seatRepo: Repository<Seat>,
     @InjectRepository(SeatMapVersion)
     private readonly seatMapVersionRepo: Repository<SeatMapVersion>,
+    private readonly dataSource: DataSource,
   ) {}
 
   /* ── Rooms ── */
@@ -96,14 +101,64 @@ export class RoomsService {
   }
 
   async updateSeat(id: string, dto: UpdateSeatDto): Promise<Seat> {
-    const seat = await this.seatRepo.findOne({ where: { id } });
-    if (!seat) throw new NotFoundException(`Seat ${id} not found`);
-    if (dto.label !== undefined) seat.label = dto.label;
-    if (dto.powerOutlet !== undefined) seat.power_outlet = dto.powerOutlet;
-    if (dto.quietZone !== undefined) seat.quiet_zone = dto.quietZone;
-    if (dto.adaAccessible !== undefined) seat.ada_accessible = dto.adaAccessible;
-    if (dto.status !== undefined) seat.status = dto.status;
-    return this.seatRepo.save(seat);
+    // Pull the seat first so we know its prior status. We need this to
+    // detect a transition INTO maintenance below.
+    const existing = await this.seatRepo.findOne({ where: { id } });
+    if (!existing) throw new NotFoundException(`Seat ${id} not found`);
+
+    const transitioningToMaintenance =
+      dto.status !== undefined &&
+      dto.status === SeatStatus.MAINTENANCE &&
+      existing.status !== SeatStatus.MAINTENANCE;
+
+    // Persist seat patch + cascade hold cancellation in a single
+    // transaction. The cascade is the audit fix: a seat moving to
+    // MAINTENANCE must not leave dangling active holds, otherwise
+    // the hold could be confirmed against an unusable seat.
+    return this.dataSource.transaction(async (manager) => {
+      const seat = await manager.findOne(Seat, { where: { id } });
+      if (!seat) throw new NotFoundException(`Seat ${id} not found`);
+
+      if (dto.label !== undefined) seat.label = dto.label;
+      if (dto.powerOutlet !== undefined) seat.power_outlet = dto.powerOutlet;
+      if (dto.quietZone !== undefined) seat.quiet_zone = dto.quietZone;
+      if (dto.adaAccessible !== undefined)
+        seat.ada_accessible = dto.adaAccessible;
+      if (dto.status !== undefined) seat.status = dto.status;
+
+      const saved = await manager.save(seat);
+
+      if (transitioningToMaintenance) {
+        await this.cancelActiveHoldsForSeat(manager, id);
+      }
+
+      return saved;
+    });
+  }
+
+  /**
+   * Cancel every reservation that is currently `HOLD` for the given
+   * seat. Used when a seat transitions to maintenance — the seat is no
+   * longer reservable, so any outstanding holds must be released so
+   * they cannot be confirmed and so the holder can re-attempt against
+   * a different seat. Runs inside the caller's transaction so the
+   * seat-status flip and the cancellations are all-or-nothing.
+   */
+  private async cancelActiveHoldsForSeat(
+    manager: import('typeorm').EntityManager,
+    seatId: string,
+  ): Promise<void> {
+    const now = new Date();
+    await manager
+      .createQueryBuilder()
+      .update(Reservation)
+      .set({
+        status: ReservationStatus.CANCELLED,
+        cancelled_at: now,
+      })
+      .where('seat_id = :seatId', { seatId })
+      .andWhere('status = :status', { status: ReservationStatus.HOLD })
+      .execute();
   }
 
   async deleteSeat(id: string): Promise<void> {

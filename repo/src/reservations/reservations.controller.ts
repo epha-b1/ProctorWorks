@@ -21,13 +21,18 @@ import { CurrentUser } from '../common/decorators/current-user.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { UseGuards } from '@nestjs/common';
 import { RolesGuard } from '../common/guards/roles.guard';
+import { TraceId } from '../common/decorators/trace-id.decorator';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Reservations')
 @ApiBearerAuth()
 @Controller('reservations')
 @UseGuards(RolesGuard)
 export class ReservationsController {
-  constructor(private readonly reservationsService: ReservationsService) {}
+  constructor(
+    private readonly reservationsService: ReservationsService,
+    private readonly auditService: AuditService,
+  ) {}
 
   @Post()
   @Roles('store_admin', 'platform_admin')
@@ -35,11 +40,24 @@ export class ReservationsController {
   @ApiResponse({ status: 201, description: 'Hold created' })
   @ApiResponse({ status: 400, description: 'Seat under maintenance' })
   @ApiResponse({ status: 409, description: 'Active hold already exists' })
-  createHold(
+  async createHold(
     @Body() dto: CreateReservationDto,
     @CurrentUser('id') userId: string,
+    @TraceId() traceId?: string,
   ) {
-    return this.reservationsService.createHold(dto.seatId, userId);
+    const reservation = await this.reservationsService.createHold(
+      dto.seatId,
+      userId,
+    );
+    await this.auditService.log(
+      userId,
+      'create_reservation_hold',
+      'reservation',
+      reservation.id,
+      { seatId: dto.seatId },
+      traceId,
+    );
+    return reservation;
   }
 
   @Get()
@@ -61,11 +79,21 @@ export class ReservationsController {
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Reservation confirmed' })
   @ApiResponse({ status: 409, description: 'Hold expired or invalid status' })
-  confirm(
+  async confirm(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser('id') userId: string,
+    @TraceId() traceId?: string,
   ) {
-    return this.reservationsService.confirm(id, userId);
+    const reservation = await this.reservationsService.confirm(id, userId);
+    await this.auditService.log(
+      userId,
+      'confirm_reservation',
+      'reservation',
+      id,
+      { seatId: reservation.seat_id },
+      traceId,
+    );
+    return reservation;
   }
 
   @Post(':id/cancel')
@@ -73,10 +101,20 @@ export class ReservationsController {
   @ApiOperation({ summary: 'Cancel a reservation' })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
   @ApiResponse({ status: 200, description: 'Reservation cancelled' })
-  cancel(
+  async cancel(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser('id') userId: string,
+    @TraceId() traceId?: string,
   ) {
-    return this.reservationsService.cancel(id, userId);
+    const reservation = await this.reservationsService.cancel(id, userId);
+    await this.auditService.log(
+      userId,
+      'cancel_reservation',
+      'reservation',
+      id,
+      { seatId: reservation.seat_id },
+      traceId,
+    );
+    return reservation;
   }
 }

@@ -156,13 +156,36 @@ export class PromotionsController {
   }
 
   @Post('coupons/:code/claim')
+  @Roles('store_admin', 'platform_admin', 'content_reviewer')
   @ApiOperation({ summary: 'Claim a coupon' })
   @ApiResponse({ status: 201, description: 'Coupon claimed' })
-  claimCoupon(
+  @ApiResponse({
+    status: 403,
+    description:
+      'Caller role is not permitted to mutate coupon state (e.g. auditor)',
+  })
+  async claimCoupon(
     @Param('code') code: string,
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
-    return this.promotionsService.claimCoupon(code, userId);
+    // HIGH-2 / audit_report-1 — `claim` is a write surface (decrements
+    // `remaining_quantity`, may flip the coupon to EXHAUSTED, creates a
+    // CouponClaim row). Without an explicit @Roles decorator, the
+    // RolesGuard returned `true` for any authenticated caller, which
+    // let the read-only `auditor` role mutate coupon state. The
+    // restriction here aligns claim with the rest of the coupon write
+    // surfaces (`POST /coupons`, `/distribute`, `/expire`).
+    const claim = await this.promotionsService.claimCoupon(code, user.id);
+    await this.auditService.log(
+      user.id,
+      'claim_coupon',
+      'coupon',
+      claim.coupon_id,
+      { code },
+      traceId,
+    );
+    return claim;
   }
 
   @Post('coupons/:code/redeem')

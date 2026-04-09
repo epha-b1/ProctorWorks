@@ -21,13 +21,18 @@ import { SubmitAttemptDto } from './dto/submit-attempt.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
+import { AuditService } from '../audit/audit.service';
 
 @ApiTags('assessments')
 @ApiBearerAuth()
 @Controller()
 @UseGuards(RolesGuard)
 export class AssessmentsController {
-  constructor(private readonly assessmentsService: AssessmentsService) {}
+  constructor(
+    private readonly assessmentsService: AssessmentsService,
+    private readonly auditService: AuditService,
+  ) {}
 
   @Get('papers')
   @Roles('platform_admin', 'store_admin', 'content_reviewer', 'auditor')
@@ -45,16 +50,30 @@ export class AssessmentsController {
   @Roles('platform_admin', 'store_admin', 'content_reviewer')
   @ApiOperation({ summary: 'Generate a paper' })
   @ApiResponse({ status: 201, description: 'Paper generated' })
-  generatePaper(
+  async generatePaper(
     @Body() dto: GeneratePaperDto,
     @CurrentUser() user: any,
     @Query('storeId') storeId?: string,
+    @TraceId() traceId?: string,
   ) {
     // Pass the full user context so the service can force the store scope
     // for store_admin from JWT (ignoring any caller-supplied `?storeId=`)
     // while still letting platform_admin / content_reviewer optionally
     // target a specific store via the query param.
-    return this.assessmentsService.generatePaper(dto, user, storeId);
+    const paper = await this.assessmentsService.generatePaper(
+      dto,
+      user,
+      storeId,
+    );
+    await this.auditService.log(
+      user.id,
+      'generate_paper',
+      'paper',
+      paper.id,
+      { storeId: paper.store_id, name: paper.name },
+      traceId,
+    );
+    return paper;
   }
 
   @Get('papers/:id')
@@ -80,34 +99,71 @@ export class AssessmentsController {
   @Roles('platform_admin', 'store_admin', 'content_reviewer')
   @ApiOperation({ summary: 'Start an attempt' })
   @ApiResponse({ status: 201, description: 'Attempt started' })
-  startAttempt(
+  async startAttempt(
     @Body() dto: StartAttemptDto,
     @CurrentUser('id') userId: string,
+    @TraceId() traceId?: string,
   ) {
-    return this.assessmentsService.startAttempt(dto.paperId, userId);
+    const attempt = await this.assessmentsService.startAttempt(
+      dto.paperId,
+      userId,
+    );
+    await this.auditService.log(
+      userId,
+      'start_attempt',
+      'attempt',
+      attempt.id,
+      { paperId: dto.paperId },
+      traceId,
+    );
+    return attempt;
   }
 
   @Post('attempts/:id/submit')
   @Roles('platform_admin', 'store_admin', 'content_reviewer')
   @ApiOperation({ summary: 'Submit an attempt with answers' })
   @ApiResponse({ status: 201, description: 'Attempt submitted and graded' })
-  submitAttempt(
+  async submitAttempt(
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: SubmitAttemptDto,
     @CurrentUser('id') userId: string,
+    @TraceId() traceId?: string,
   ) {
-    return this.assessmentsService.submitAttempt(id, dto.answers, userId);
+    const attempt = await this.assessmentsService.submitAttempt(
+      id,
+      dto.answers,
+      userId,
+    );
+    await this.auditService.log(
+      userId,
+      'submit_attempt',
+      'attempt',
+      id,
+      { answerCount: dto.answers?.length ?? 0 },
+      traceId,
+    );
+    return attempt;
   }
 
   @Post('attempts/:id/redo')
   @Roles('platform_admin', 'store_admin', 'content_reviewer')
   @ApiOperation({ summary: 'Redo an attempt' })
   @ApiResponse({ status: 201, description: 'New attempt created for redo' })
-  redoAttempt(
+  async redoAttempt(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser('id') userId: string,
+    @TraceId() traceId?: string,
   ) {
-    return this.assessmentsService.redoAttempt(id, userId);
+    const attempt = await this.assessmentsService.redoAttempt(id, userId);
+    await this.auditService.log(
+      userId,
+      'redo_attempt',
+      'attempt',
+      id,
+      { newAttemptId: (attempt as any)?.id },
+      traceId,
+    );
+    return attempt;
   }
 
   @Get('attempts/history')

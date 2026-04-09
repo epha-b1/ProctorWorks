@@ -1,5 +1,7 @@
 /// <reference types="jest" />
+import 'reflect-metadata';
 import { ConflictException, NotFoundException } from '@nestjs/common';
+import { getMetadataArgsStorage } from 'typeorm';
 import { OrdersService } from '../src/orders/orders.service';
 import { Order, OrderStatus } from '../src/orders/entities/order.entity';
 
@@ -56,6 +58,42 @@ function buildOrder(overrides: Partial<Order> = {}): Order {
 // ---------------------------------------------------------------------------
 // Test suite
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// HIGH-1 — Order entity must NOT carry `unique: true` on idempotency_key
+// ---------------------------------------------------------------------------
+//
+// The previous schema enforced uniqueness on `orders.idempotency_key` at
+// the table level (via `@Column({ unique: true })`). That conflicts with
+// the scoped idempotency design — two callers in different stores can
+// legitimately reuse the same opaque key. This test asserts the entity
+// metadata so that any future regression that re-adds `unique: true`
+// (or wraps the column in a single-column @Index({ unique: true }))
+// fails fast in unit tests, before it ever reaches the migration layer.
+describe('Order entity metadata', () => {
+  it('idempotency_key column is not declared unique', () => {
+    const storage = getMetadataArgsStorage();
+    const col = storage.columns.find(
+      (c) => c.target === Order && c.propertyName === 'idempotency_key',
+    );
+    expect(col).toBeDefined();
+    // Either `unique` is not set OR explicitly false. Anything else
+    // would re-introduce the global UNIQUE constraint that HIGH-1 fixed.
+    const opts = (col!.options ?? {}) as Record<string, unknown>;
+    expect(opts.unique === undefined || opts.unique === false).toBe(true);
+  });
+
+  it('no single-column unique @Index covers idempotency_key', () => {
+    const storage = getMetadataArgsStorage();
+    const offending = storage.indices.find((idx) => {
+      if (idx.target !== Order) return false;
+      if (!idx.unique) return false;
+      const cols = Array.isArray(idx.columns) ? idx.columns : [];
+      return cols.length === 1 && cols[0] === 'idempotency_key';
+    });
+    expect(offending).toBeUndefined();
+  });
+});
 
 describe('OrdersService', () => {
   let service: OrdersService;
