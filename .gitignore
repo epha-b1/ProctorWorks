@@ -1,3 +1,4 @@
 .claude/
 .tmp/
 *.tmpl
+.work/
