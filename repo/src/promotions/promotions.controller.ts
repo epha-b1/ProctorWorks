@@ -24,6 +24,7 @@ import { DistributeCouponDto } from './dto/distribute-coupon.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
 import { AuditService } from '../audit/audit.service';
 
 @ApiTags('promotions')
@@ -51,12 +52,23 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a promotion' })
   @ApiResponse({ status: 201, description: 'Promotion created' })
-  async createPromotion(@Body() dto: CreatePromotionDto, @CurrentUser() user: any) {
+  async createPromotion(
+    @Body() dto: CreatePromotionDto,
+    @CurrentUser() user: any,
+    @TraceId() traceId?: string,
+  ) {
     if (user.role === 'store_admin') {
       dto.storeId = user.storeId;
     }
     const promotion = await this.promotionsService.createPromotion(dto);
-    await this.auditService.log(user.id, 'create_promotion', 'promotion', promotion.id);
+    await this.auditService.log(
+      user.id,
+      'create_promotion',
+      'promotion',
+      promotion.id,
+      undefined,
+      traceId,
+    );
     return promotion;
   }
 
@@ -68,12 +80,18 @@ export class PromotionsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: Partial<CreatePromotionDto>,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     const storeId = user.role === 'store_admin' ? user.storeId : undefined;
     return this.promotionsService.updatePromotion(id, dto, storeId).then(async (promotion) => {
-      await this.auditService.log(user.id, 'update_promotion', 'promotion', id, {
-        fields: Object.keys(dto || {}),
-      });
+      await this.auditService.log(
+        user.id,
+        'update_promotion',
+        'promotion',
+        id,
+        { fields: Object.keys(dto || {}) },
+        traceId,
+      );
       return promotion;
     });
   }
@@ -86,10 +104,18 @@ export class PromotionsController {
   deletePromotion(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     const storeId = user.role === 'store_admin' ? user.storeId : undefined;
     return this.promotionsService.deletePromotion(id, storeId).then(async () => {
-      await this.auditService.log(user.id, 'delete_promotion', 'promotion', id);
+      await this.auditService.log(
+        user.id,
+        'delete_promotion',
+        'promotion',
+        id,
+        undefined,
+        traceId,
+      );
       return;
     });
   }
@@ -109,12 +135,23 @@ export class PromotionsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a coupon' })
   @ApiResponse({ status: 201, description: 'Coupon created' })
-  async createCoupon(@Body() dto: CreateCouponDto, @CurrentUser() user: any) {
+  async createCoupon(
+    @Body() dto: CreateCouponDto,
+    @CurrentUser() user: any,
+    @TraceId() traceId?: string,
+  ) {
     if (user.role === 'store_admin') {
       dto.storeId = user.storeId;
     }
     const coupon = await this.promotionsService.createCoupon(dto);
-    await this.auditService.log(user.id, 'create_coupon', 'coupon', coupon.id);
+    await this.auditService.log(
+      user.id,
+      'create_coupon',
+      'coupon',
+      coupon.id,
+      undefined,
+      traceId,
+    );
     return coupon;
   }
 
@@ -149,11 +186,17 @@ export class PromotionsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: DistributeCouponDto,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.promotionsService.distributeCoupon(id, dto.userIds, user).then(async (claims) => {
-      await this.auditService.log(user.id, 'distribute_coupon', 'coupon', id, {
-        recipientCount: dto.userIds.length,
-      });
+      await this.auditService.log(
+        user.id,
+        'distribute_coupon',
+        'coupon',
+        id,
+        { recipientCount: dto.userIds.length },
+        traceId,
+      );
       return claims;
     });
   }
@@ -165,9 +208,17 @@ export class PromotionsController {
   expireCoupon(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.promotionsService.expireCoupon(id, user).then(async (coupon) => {
-      await this.auditService.log(user.id, 'expire_coupon', 'coupon', id);
+      await this.auditService.log(
+        user.id,
+        'expire_coupon',
+        'coupon',
+        id,
+        undefined,
+        traceId,
+      );
       return coupon;
     });
   }

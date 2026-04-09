@@ -58,6 +58,15 @@ npm run test:unit -- --runInBand
 npm run test:api -- --runInBand
 ```
 
+`npm run test:api` runs a fast Postgres handshake preflight
+(`scripts/check-test-db.js`) before invoking Jest. If the test DB is
+unreachable the preflight exits 1 with a clear diagnostic and the
+suite never starts. Override the target DB with
+`DATABASE_URL=postgres://user:pass@host:port/db npm run test:api`.
+On hosts where docker port-forwarding is flaky, start Postgres in
+host-network mode (see `scripts/check-test-db.js` for the exact
+command) and point `DATABASE_URL` at it.
+
 ## Services
 
 | Service | Port |

@@ -395,11 +395,15 @@ UPDATE seats SET status=available WHERE id IN (expired reservations)
 ## 7. Security Design
 
 - Passwords: bcrypt with 12 rounds
-- JWT: HS256, secret from env, 8-hour expiry
+- JWT: HS256, secret from env, 8-hour expiry, carries `jti` claim linked to a server-side `sessions` row
+- Session lifecycle: a `sessions` row is created on login (active=true). Logout flips `is_active=false` and the JWT strategy rejects subsequent requests carrying the same `jti` with 401. Suspending or locking a user via `PATCH /users/:id` invalidates every active session for that user.
 - Field encryption: AES-256-GCM for `orders.internal_notes`, `users.notes`
 - Audit log: INSERT-only for app DB role, no UPDATE/DELETE
-- Row-level access: store_admin queries always filtered by `store_id`
-- Trace IDs: UUID generated per request, attached to all log lines and response header `X-Trace-Id`
+- Row-level access: store_admin queries always filtered by `store_id`. Question bank operations (create/read/update/delete/wrong-answer-stats/import/export) derive `store_id` from the JWT for store_admin and reject cross-store access with 404.
+- Role matrix on Assessments: `auditor` is read-only — `GET /papers`, `GET /papers/:id`, `GET /attempts/history` are open to platform_admin / store_admin / content_reviewer / auditor; `POST /papers`, `POST /attempts`, `POST /attempts/:id/submit`, `POST /attempts/:id/redo` exclude auditor and return 403.
+- Quality rules: rule config columns are validated against a per-entity-type allowlist before persistence and re-validated at evaluation time; raw SQL identifier interpolation is not accepted.
+- Promotion redemption: `redemption_count` is incremented atomically inside the redeem transaction with a guard `redemption_count < redemption_cap`; cap-at-limit redemptions return 400. Distribution flow re-runs the same status/window/quantity checks as direct claim and decrements `remaining_quantity` by the recipient count atomically.
+- Trace IDs: UUID generated per request by `TraceIdInterceptor`, attached to all log lines and the response header `X-Trace-Id`. Audit log entries pick up the same trace ID via the `@TraceId()` parameter decorator passed to `auditService.log(...)`.
 - Sensitive fields masked in audit export: password_hash, encrypted fields shown as `[REDACTED]`
 
 ---
@@ -409,8 +413,8 @@ UPDATE seats SET status=available WHERE id IN (expired reservations)
 | Job | Interval | Description |
 |---|---|---|
 | Release expired holds | 60s | Set expired reservations to expired status |
-| Low-stock check | 15 min | Create notifications for SKUs below threshold |
-| Expiration date check | 1 hour | Create notifications for lots expiring within 7 days |
+| Low-stock check | 10 min | Create notifications for SKUs below threshold |
+| Expiration date check | Daily at 00:00 | Create notifications for lots expiring within 7 days |
 | Data quality score | 1 hour | Recompute quality scores per entity type |
 | Freshness check | 1 hour | Create notifications for stale datasets |
 | Coupon expiry | 1 hour | Set expired coupons to expired status |

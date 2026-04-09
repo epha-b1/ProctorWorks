@@ -27,6 +27,7 @@ import { AdjustStockDto } from './dto/adjust-stock.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
 import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Inventory')
@@ -43,11 +44,20 @@ export class InventoryController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create an inventory lot' })
   @ApiResponse({ status: 201, description: 'Lot created' })
-  async createLot(@Body() dto: CreateLotDto, @CurrentUser() user: any) {
+  async createLot(
+    @Body() dto: CreateLotDto,
+    @CurrentUser() user: any,
+    @TraceId() traceId?: string,
+  ) {
     const lot = await this.inventoryService.createLot(dto, user);
-    await this.auditService.log(user.id, 'create_inventory_lot', 'inventory_lot', lot.id, {
-      skuId: dto.skuId,
-    });
+    await this.auditService.log(
+      user.id,
+      'create_inventory_lot',
+      'inventory_lot',
+      lot.id,
+      { skuId: dto.skuId },
+      traceId,
+    );
     return lot;
   }
 
@@ -69,6 +79,7 @@ export class InventoryController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: Partial<CreateLotDto>,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     const updates: any = {};
     if (dto.batchCode !== undefined) updates.batch_code = dto.batchCode;
@@ -76,9 +87,14 @@ export class InventoryController {
       updates.expiration_date = dto.expirationDate;
     if (dto.quantity !== undefined) updates.quantity = dto.quantity;
     return this.inventoryService.updateLot(id, updates, user).then(async (lot) => {
-      await this.auditService.log(user.id, 'update_inventory_lot', 'inventory_lot', id, {
-        fields: Object.keys(dto || {}),
-      });
+      await this.auditService.log(
+        user.id,
+        'update_inventory_lot',
+        'inventory_lot',
+        id,
+        { fields: Object.keys(dto || {}) },
+        traceId,
+      );
       return lot;
     });
   }
@@ -94,18 +110,26 @@ export class InventoryController {
     @CurrentUser('id') userId: string,
     @CurrentUser() user: any,
     @Res({ passthrough: true }) res: Response,
+    @TraceId() traceId?: string,
   ) {
     const { adjustment, alreadyExisted } =
       await this.inventoryService.adjustStock(dto, userId, user);
     if (!alreadyExisted) {
       res.status(HttpStatus.CREATED);
     }
-    await this.auditService.log(user.id, 'adjust_inventory_stock', 'inventory_lot', dto.lotId, {
-      delta: dto.delta,
-      reasonCode: dto.reasonCode,
-      idempotencyKey: dto.idempotencyKey,
-      alreadyExisted,
-    });
+    await this.auditService.log(
+      user.id,
+      'adjust_inventory_stock',
+      'inventory_lot',
+      dto.lotId,
+      {
+        delta: dto.delta,
+        reasonCode: dto.reasonCode,
+        idempotencyKey: dto.idempotencyKey,
+        alreadyExisted,
+      },
+      traceId,
+    );
     return adjustment;
   }
 }

@@ -1,4 +1,8 @@
-import { NotFoundException, BadRequestException } from '@nestjs/common';
+import {
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { AssessmentsService } from '../src/assessments/assessments.service';
 import { AttemptStatus } from '../src/assessments/entities/attempt.entity';
 import { QuestionType, QuestionStatus } from '../src/questions/entities/question.entity';
@@ -446,6 +450,161 @@ describe('AssessmentsService', () => {
       const savedEntity = attemptRepo.save.mock.calls[0][0];
       // The saved entity is NOT the original
       expect(savedEntity).not.toBe(original);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // F-P1: paper tenant isolation (getPapers / getPaper)
+  // -----------------------------------------------------------------------
+  describe('paper tenant isolation (F-P1)', () => {
+    const platformAdmin = { id: 'admin-1', role: 'platform_admin', storeId: null };
+    const storeAdminA = { id: 'sa-a', role: 'store_admin', storeId: 'store-A' };
+    const storeAdminB = { id: 'sa-b', role: 'store_admin', storeId: 'store-B' };
+    const storeAdminNone = { id: 'sa-x', role: 'store_admin', storeId: null };
+    const auditor = { id: 'aud-1', role: 'auditor', storeId: null };
+    const reviewer = { id: 'rev-1', role: 'content_reviewer', storeId: null };
+
+    describe('getPapers', () => {
+      it('store_admin: forces filter by JWT store, ignoring query storeId', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.find.mockResolvedValue([]);
+
+        // Caller passes storeId=store-B but the JWT says store-A —
+        // the service must pin the filter to store-A.
+        await service.getPapers(storeAdminA, 'store-B');
+
+        expect(paperRepo.find).toHaveBeenCalledWith({
+          where: { store_id: 'store-A' },
+          relations: ['paper_questions'],
+        });
+      });
+
+      it('store_admin without a store assignment → ForbiddenException', async () => {
+        const { service } = buildService();
+        await expect(service.getPapers(storeAdminNone)).rejects.toThrow(
+          ForbiddenException,
+        );
+      });
+
+      it('platform_admin: no scope filter when storeId is omitted', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.find.mockResolvedValue([]);
+
+        await service.getPapers(platformAdmin);
+
+        expect(paperRepo.find).toHaveBeenCalledWith({
+          where: {},
+          relations: ['paper_questions'],
+        });
+      });
+
+      it('platform_admin: honors optional storeId query param', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.find.mockResolvedValue([]);
+
+        await service.getPapers(platformAdmin, 'store-Z');
+
+        expect(paperRepo.find).toHaveBeenCalledWith({
+          where: { store_id: 'store-Z' },
+          relations: ['paper_questions'],
+        });
+      });
+
+      it('auditor: no scope filter (read-only role is unchanged)', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.find.mockResolvedValue([]);
+
+        await service.getPapers(auditor);
+
+        expect(paperRepo.find).toHaveBeenCalledWith({
+          where: {},
+          relations: ['paper_questions'],
+        });
+      });
+
+      it('content_reviewer: no scope filter (existing behavior preserved)', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.find.mockResolvedValue([]);
+
+        await service.getPapers(reviewer);
+
+        expect(paperRepo.find).toHaveBeenCalledWith({
+          where: {},
+          relations: ['paper_questions'],
+        });
+      });
+    });
+
+    describe('getPaper', () => {
+      it('store_admin A: 404 when the paper belongs to store B', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.findOne.mockResolvedValue({
+          id: 'p1',
+          store_id: 'store-B',
+          name: 'foreign',
+        });
+
+        await expect(service.getPaper('p1', storeAdminA)).rejects.toThrow(
+          NotFoundException,
+        );
+      });
+
+      it('store_admin A: 200 when the paper belongs to store A', async () => {
+        const { service, paperRepo } = buildService();
+        const paper = { id: 'p1', store_id: 'store-A', name: 'own' };
+        paperRepo.findOne.mockResolvedValue(paper);
+
+        const result = await service.getPaper('p1', storeAdminA);
+        expect(result).toBe(paper);
+      });
+
+      it('platform_admin: can read any paper regardless of store_id', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.findOne.mockResolvedValue({
+          id: 'p1',
+          store_id: 'store-B',
+          name: 'other',
+        });
+
+        const result = await service.getPaper('p1', platformAdmin);
+        expect(result.store_id).toBe('store-B');
+      });
+
+      it('auditor: can read any paper (read-only role is unchanged)', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.findOne.mockResolvedValue({
+          id: 'p1',
+          store_id: 'store-C',
+          name: 'any',
+        });
+
+        const result = await service.getPaper('p1', auditor);
+        expect(result.store_id).toBe('store-C');
+      });
+
+      it('missing paper: 404 for every role (unchanged)', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.findOne.mockResolvedValue(null);
+
+        await expect(
+          service.getPaper('ghost', platformAdmin),
+        ).rejects.toThrow(NotFoundException);
+        await expect(
+          service.getPaper('ghost', storeAdminA),
+        ).rejects.toThrow(NotFoundException);
+      });
+
+      it('store_admin without a store: 403 on every paper read', async () => {
+        const { service, paperRepo } = buildService();
+        paperRepo.findOne.mockResolvedValue({
+          id: 'p1',
+          store_id: 'store-A',
+        });
+
+        await expect(service.getPaper('p1', storeAdminNone)).rejects.toThrow(
+          ForbiddenException,
+        );
+      });
     });
   });
 

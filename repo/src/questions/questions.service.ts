@@ -1,6 +1,7 @@
 import {
   Injectable,
   NotFoundException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
@@ -22,16 +23,38 @@ export class QuestionsService {
     private readonly dataSource: DataSource,
   ) {}
 
+  private resolveStoreScope(user?: any): string | null {
+    if (user?.role === 'store_admin') {
+      const storeId = user?.storeId ?? user?.store_id ?? null;
+      if (!storeId) {
+        throw new ForbiddenException('Store admin has no assigned store');
+      }
+      return storeId;
+    }
+    return null;
+  }
+
+  private enforceQuestionOwnership(question: Question, user?: any): void {
+    const storeId = this.resolveStoreScope(user);
+    if (storeId && question.store_id !== storeId) {
+      throw new NotFoundException('Question not found');
+    }
+  }
+
   async createQuestion(
     dto: CreateQuestionDto,
     userId: string,
+    user?: any,
     storeId?: string,
   ): Promise<Question> {
+    // store_admin: always use their own store, ignore caller-provided storeId
+    const resolvedStoreId = this.resolveStoreScope(user) ?? storeId ?? null;
+
     const question = this.questionRepo.create({
       type: dto.type,
       body: dto.body,
       created_by: userId,
-      store_id: storeId ?? null,
+      store_id: resolvedStoreId,
     });
 
     const savedQuestion = await this.questionRepo.save(question);
@@ -50,11 +73,12 @@ export class QuestionsService {
     return savedQuestion;
   }
 
-  async updateQuestion(id: string, dto: UpdateQuestionDto): Promise<Question> {
+  async updateQuestion(id: string, dto: UpdateQuestionDto, user?: any): Promise<Question> {
     const question = await this.questionRepo.findOne({ where: { id } });
     if (!question) {
       throw new NotFoundException('Question not found');
     }
+    this.enforceQuestionOwnership(question, user);
 
     if (dto.body !== undefined) question.body = dto.body;
     if (dto.type !== undefined) question.type = dto.type;
@@ -62,22 +86,27 @@ export class QuestionsService {
     return this.questionRepo.save(question);
   }
 
-  async deleteQuestion(id: string): Promise<void> {
-    const result = await this.questionRepo.delete(id);
-    if (result.affected === 0) {
+  async deleteQuestion(id: string, user?: any): Promise<void> {
+    const question = await this.questionRepo.findOne({ where: { id } });
+    if (!question) {
       throw new NotFoundException('Question not found');
     }
+    this.enforceQuestionOwnership(question, user);
+    await this.questionRepo.remove(question);
   }
 
   async findAll(filters?: {
     type?: QuestionType;
     status?: QuestionStatus;
     storeId?: string;
-  }): Promise<Question[]> {
+  }, user?: any): Promise<Question[]> {
     const where: any = {};
     if (filters?.type) where.type = filters.type;
     if (filters?.status) where.status = filters.status;
-    if (filters?.storeId) where.store_id = filters.storeId;
+
+    // store_admin: enforce their store scope regardless of query param
+    const storeId = this.resolveStoreScope(user) ?? filters?.storeId;
+    if (storeId) where.store_id = storeId;
 
     return this.questionRepo.find({
       where,
@@ -85,7 +114,7 @@ export class QuestionsService {
     });
   }
 
-  async findById(id: string): Promise<Question> {
+  async findById(id: string, user?: any): Promise<Question> {
     const question = await this.questionRepo.findOne({
       where: { id },
       relations: ['options', 'explanations'],
@@ -93,23 +122,26 @@ export class QuestionsService {
     if (!question) {
       throw new NotFoundException('Question not found');
     }
+    this.enforceQuestionOwnership(question, user);
     return question;
   }
 
-  async approveQuestion(id: string): Promise<Question> {
+  async approveQuestion(id: string, user?: any): Promise<Question> {
     const question = await this.questionRepo.findOne({ where: { id } });
     if (!question) {
       throw new NotFoundException('Question not found');
     }
+    this.enforceQuestionOwnership(question, user);
     question.status = QuestionStatus.APPROVED;
     return this.questionRepo.save(question);
   }
 
-  async rejectQuestion(id: string): Promise<Question> {
+  async rejectQuestion(id: string, user?: any): Promise<Question> {
     const question = await this.questionRepo.findOne({ where: { id } });
     if (!question) {
       throw new NotFoundException('Question not found');
     }
+    this.enforceQuestionOwnership(question, user);
     question.status = QuestionStatus.REJECTED;
     return this.questionRepo.save(question);
   }
@@ -118,6 +150,7 @@ export class QuestionsService {
     questionId: string,
     body: string,
     userId: string,
+    user?: any,
   ): Promise<QuestionExplanation> {
     const question = await this.questionRepo.findOne({
       where: { id: questionId },
@@ -125,6 +158,7 @@ export class QuestionsService {
     if (!question) {
       throw new NotFoundException('Question not found');
     }
+    this.enforceQuestionOwnership(question, user);
 
     // Auto-increment version_number
     const latest = await this.explanationRepo
@@ -155,8 +189,10 @@ export class QuestionsService {
   async bulkImport(
     questions: CreateQuestionDto[],
     userId: string,
+    user?: any,
     storeId?: string,
   ): Promise<{ count: number }> {
+    const resolvedStoreId = this.resolveStoreScope(user) ?? storeId ?? null;
     let count = 0;
 
     await this.dataSource.transaction(async (manager) => {
@@ -165,7 +201,7 @@ export class QuestionsService {
           type: dto.type,
           body: dto.body,
           created_by: userId,
-          store_id: storeId ?? null,
+          store_id: resolvedStoreId,
         });
 
         const savedQuestion = await manager.save(question);
@@ -192,8 +228,8 @@ export class QuestionsService {
     type?: QuestionType;
     status?: QuestionStatus;
     storeId?: string;
-  }): Promise<string> {
-    const questions = await this.findAll(filters);
+  }, user?: any): Promise<string> {
+    const questions = await this.findAll(filters, user);
 
     const header = 'id,type,body,status,options';
     const rows = questions.map((q) => {
@@ -211,7 +247,14 @@ export class QuestionsService {
 
   async getWrongAnswerStats(
     questionId: string,
+    user?: any,
   ): Promise<Record<string, number>> {
+    const question = await this.questionRepo.findOne({ where: { id: questionId } });
+    if (!question) {
+      throw new NotFoundException('Question not found');
+    }
+    this.enforceQuestionOwnership(question, user);
+
     const results = await this.dataSource
       .createQueryBuilder()
       .select('aa.selected_option_id', 'optionId')

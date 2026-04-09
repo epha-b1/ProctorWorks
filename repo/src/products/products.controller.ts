@@ -26,6 +26,7 @@ import { CreateBrandDto } from './dto/create-brand.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
 import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Products')
@@ -44,9 +45,20 @@ export class ProductsController {
   @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Create a product' })
   @ApiResponse({ status: 201, description: 'Product created' })
-  async createProduct(@Body() dto: CreateProductDto, @CurrentUser() user: any) {
+  async createProduct(
+    @Body() dto: CreateProductDto,
+    @CurrentUser() user: any,
+    @TraceId() traceId?: string,
+  ) {
     const product = await this.productsService.createProduct(dto, user);
-    await this.auditService.log(user.id, 'create_product', 'product', product.id);
+    await this.auditService.log(
+      user.id,
+      'create_product',
+      'product',
+      product.id,
+      undefined,
+      traceId,
+    );
     return product;
   }
 
@@ -79,11 +91,17 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateProductDto,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.productsService.updateProduct(id, dto, user).then(async (product) => {
-      await this.auditService.log(user.id, 'update_product', 'product', id, {
-        fields: Object.keys(dto || {}),
-      });
+      await this.auditService.log(
+        user.id,
+        'update_product',
+        'product',
+        id,
+        { fields: Object.keys(dto || {}) },
+        traceId,
+      );
       return product;
     });
   }
@@ -96,9 +114,17 @@ export class ProductsController {
   deleteProduct(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.productsService.deleteProduct(id, user).then(async (result) => {
-      await this.auditService.log(user.id, 'delete_product', 'product', id);
+      await this.auditService.log(
+        user.id,
+        'delete_product',
+        'product',
+        id,
+        undefined,
+        traceId,
+      );
       return result;
     });
   }
@@ -111,9 +137,17 @@ export class ProductsController {
   publishProduct(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.productsService.publishProduct(id, user).then(async (product) => {
-      await this.auditService.log(user.id, 'publish_product', 'product', id);
+      await this.auditService.log(
+        user.id,
+        'publish_product',
+        'product',
+        id,
+        undefined,
+        traceId,
+      );
       return product;
     });
   }
@@ -126,9 +160,17 @@ export class ProductsController {
   unpublishProduct(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.productsService.unpublishProduct(id, user).then(async (product) => {
-      await this.auditService.log(user.id, 'unpublish_product', 'product', id);
+      await this.auditService.log(
+        user.id,
+        'unpublish_product',
+        'product',
+        id,
+        undefined,
+        traceId,
+      );
       return product;
     });
   }
@@ -156,11 +198,17 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateSkuDto,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.productsService.createSku(id, dto, user).then(async (sku) => {
-      await this.auditService.log(user.id, 'create_sku', 'sku', sku.id, {
-        productId: id,
-      });
+      await this.auditService.log(
+        user.id,
+        'create_sku',
+        'sku',
+        sku.id,
+        { productId: id },
+        traceId,
+      );
       return sku;
     });
   }
@@ -174,11 +222,17 @@ export class ProductsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateSkuDto,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.productsService.updateSku(id, dto, user).then(async (sku) => {
-      await this.auditService.log(user.id, 'update_sku', 'sku', id, {
-        fields: Object.keys(dto || {}),
-      });
+      await this.auditService.log(
+        user.id,
+        'update_sku',
+        'sku',
+        id,
+        { fields: Object.keys(dto || {}) },
+        traceId,
+      );
       return sku;
     });
   }
@@ -191,9 +245,17 @@ export class ProductsController {
   deleteSku(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
     return this.productsService.deleteSku(id, user).then(async (result) => {
-      await this.auditService.log(user.id, 'delete_sku', 'sku', id);
+      await this.auditService.log(
+        user.id,
+        'delete_sku',
+        'sku',
+        id,
+        undefined,
+        traceId,
+      );
       return result;
     });
   }
@@ -214,9 +276,17 @@ export class ProductsController {
   async createCategory(
     @Body() dto: CreateCategoryDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     const category = await this.productsService.createCategory(dto);
-    await this.auditService.log(actorId, 'create_category', 'category', category.id);
+    await this.auditService.log(
+      actorId,
+      'create_category',
+      'category',
+      category.id,
+      undefined,
+      traceId,
+    );
     return category;
   }
 
@@ -236,9 +306,17 @@ export class ProductsController {
   async createBrand(
     @Body() dto: CreateBrandDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     const brand = await this.productsService.createBrand(dto);
-    await this.auditService.log(actorId, 'create_brand', 'brand', brand.id);
+    await this.auditService.log(
+      actorId,
+      'create_brand',
+      'brand',
+      brand.id,
+      undefined,
+      traceId,
+    );
     return brand;
   }
 }

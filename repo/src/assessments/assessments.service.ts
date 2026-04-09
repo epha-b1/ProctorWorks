@@ -2,6 +2,7 @@ import {
   Injectable,
   NotFoundException,
   BadRequestException,
+  ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, DataSource } from 'typeorm';
@@ -31,6 +32,43 @@ export class AssessmentsService {
     private readonly optionRepo: Repository<QuestionOption>,
     private readonly dataSource: DataSource,
   ) {}
+
+  /**
+   * Resolves the effective store scope for a caller.
+   *
+   * - store_admin  → their assigned store id (403 if none is assigned)
+   * - everyone else → null (no scope restriction applied)
+   *
+   * This is the single place in the service where we decide whether a
+   * query needs to be tenant-scoped. Returning null for non-store-admin
+   * preserves platform_admin, content_reviewer, and auditor behavior
+   * exactly; returning the assigned id for store_admin is what closes
+   * the cross-store paper read leak.
+   */
+  private resolveStoreScope(user?: any): string | null {
+    if (user?.role === 'store_admin') {
+      const storeId = user?.storeId ?? user?.store_id ?? null;
+      if (!storeId) {
+        throw new ForbiddenException('Store admin has no assigned store');
+      }
+      return storeId;
+    }
+    return null;
+  }
+
+  /**
+   * Ownership guard for per-paper reads. For store_admin callers, the
+   * paper must live in their own store — otherwise we throw 404 (not
+   * 403) so the existence of cross-store papers isn't leaked through
+   * the status code, matching the tenant-isolation hiding policy used
+   * by the questions module.
+   */
+  private enforcePaperOwnership(paper: Paper, user?: any): void {
+    const scope = this.resolveStoreScope(user);
+    if (scope && paper.store_id !== scope) {
+      throw new NotFoundException('Paper not found');
+    }
+  }
 
   async generatePaper(
     dto: GeneratePaperDto,
@@ -238,15 +276,26 @@ export class AssessmentsService {
     });
   }
 
-  async getPapers(storeId?: string): Promise<Paper[]> {
+  async getPapers(user?: any, storeId?: string): Promise<Paper[]> {
+    // store_admin: always filter by the JWT's assigned store — the
+    // caller-supplied `storeId` query param is ignored on purpose.
+    // Trusting it here would re-introduce the cross-store read leak
+    // this method is being hardened against.
+    //
+    // Everyone else (platform_admin / content_reviewer / auditor):
+    // keep the existing behavior — optional `storeId` query param
+    // narrows the listing; omitting it returns all papers.
+    const scopedStoreId = this.resolveStoreScope(user);
     const where: any = {};
-    if (storeId) {
+    if (scopedStoreId) {
+      where.store_id = scopedStoreId;
+    } else if (storeId) {
       where.store_id = storeId;
     }
     return this.paperRepo.find({ where, relations: ['paper_questions'] });
   }
 
-  async getPaper(id: string): Promise<Paper> {
+  async getPaper(id: string, user?: any): Promise<Paper> {
     const paper = await this.paperRepo.findOne({
       where: { id },
       relations: ['paper_questions', 'paper_questions.question', 'paper_questions.question.options'],
@@ -255,6 +304,10 @@ export class AssessmentsService {
     if (!paper) {
       throw new NotFoundException('Paper not found');
     }
+
+    // Tenant-isolation check — for store_admin, a paper in another
+    // store is indistinguishable from a missing paper (404, not 403).
+    this.enforcePaperOwnership(paper, user);
 
     return paper;
   }

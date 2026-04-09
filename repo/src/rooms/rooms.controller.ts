@@ -25,6 +25,7 @@ import { PublishSeatMapDto } from './dto/publish-seat-map.dto';
 import { Roles } from '../common/decorators/roles.decorator';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
 import { AuditService } from '../audit/audit.service';
 
 @ApiTags('Rooms')
@@ -43,9 +44,20 @@ export class RoomsController {
   @Roles('platform_admin')
   @ApiOperation({ summary: 'Create a study room' })
   @ApiResponse({ status: 201, description: 'Room created' })
-  async createRoom(@Body() dto: CreateRoomDto, @CurrentUser('id') actorId: string) {
+  async createRoom(
+    @Body() dto: CreateRoomDto,
+    @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
+  ) {
     const room = await this.roomsService.createRoom(dto);
-    await this.auditService.log(actorId, 'create_room', 'room', room.id);
+    await this.auditService.log(
+      actorId,
+      'create_room',
+      'room',
+      room.id,
+      undefined,
+      traceId,
+    );
     return room;
   }
 
@@ -73,11 +85,17 @@ export class RoomsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateRoomDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.roomsService.updateRoom(id, dto).then(async (room) => {
-      await this.auditService.log(actorId, 'update_room', 'room', id, {
-        fields: Object.keys(dto || {}),
-      });
+      await this.auditService.log(
+        actorId,
+        'update_room',
+        'room',
+        id,
+        { fields: Object.keys(dto || {}) },
+        traceId,
+      );
       return room;
     });
   }
@@ -90,9 +108,17 @@ export class RoomsController {
   deleteRoom(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.roomsService.deleteRoom(id).then(async (result) => {
-      await this.auditService.log(actorId, 'delete_room', 'room', id);
+      await this.auditService.log(
+        actorId,
+        'delete_room',
+        'room',
+        id,
+        undefined,
+        traceId,
+      );
       return result;
     });
   }
@@ -116,11 +142,17 @@ export class RoomsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateZoneDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.roomsService.createZone(id, dto).then(async (zone) => {
-      await this.auditService.log(actorId, 'create_zone', 'zone', zone.id, {
-        roomId: id,
-      });
+      await this.auditService.log(
+        actorId,
+        'create_zone',
+        'zone',
+        zone.id,
+        { roomId: id },
+        traceId,
+      );
       return zone;
     });
   }
@@ -144,11 +176,17 @@ export class RoomsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: CreateSeatDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.roomsService.createSeat(id, dto).then(async (seat) => {
-      await this.auditService.log(actorId, 'create_seat', 'seat', seat.id, {
-        zoneId: id,
-      });
+      await this.auditService.log(
+        actorId,
+        'create_seat',
+        'seat',
+        seat.id,
+        { zoneId: id },
+        traceId,
+      );
       return seat;
     });
   }
@@ -162,11 +200,17 @@ export class RoomsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateSeatDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.roomsService.updateSeat(id, dto).then(async (seat) => {
-      await this.auditService.log(actorId, 'update_seat', 'seat', id, {
-        fields: Object.keys(dto || {}),
-      });
+      await this.auditService.log(
+        actorId,
+        'update_seat',
+        'seat',
+        id,
+        { fields: Object.keys(dto || {}) },
+        traceId,
+      );
       return seat;
     });
   }
@@ -179,9 +223,17 @@ export class RoomsController {
   deleteSeat(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.roomsService.deleteSeat(id).then(async (result) => {
-      await this.auditService.log(actorId, 'delete_seat', 'seat', id);
+      await this.auditService.log(
+        actorId,
+        'delete_seat',
+        'seat',
+        id,
+        undefined,
+        traceId,
+      );
       return result;
     });
   }
@@ -197,11 +249,17 @@ export class RoomsController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: PublishSeatMapDto,
     @CurrentUser('id') userId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.roomsService.publishSeatMap(id, dto.changeNote, userId).then(async (version) => {
-      await this.auditService.log(userId, 'publish_seat_map', 'room', id, {
-        version: version.version_number,
-      });
+      await this.auditService.log(
+        userId,
+        'publish_seat_map',
+        'room',
+        id,
+        { version: version.version_number },
+        traceId,
+      );
       return version;
     });
   }

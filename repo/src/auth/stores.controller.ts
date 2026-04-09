@@ -25,6 +25,7 @@ import { Store } from './entities/store.entity';
 import { Roles } from '../common/decorators/roles.decorator';
 import { UserRole } from './entities/user.entity';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
 import { AuditService } from '../audit/audit.service';
 
 export class CreateStoreDto {
@@ -63,12 +64,21 @@ export class StoresController {
   @Roles(UserRole.PLATFORM_ADMIN)
   @ApiOperation({ summary: 'Create a store (platform_admin only)' })
   @ApiResponse({ status: 201, description: 'Store created' })
-  async create(@Body() dto: CreateStoreDto, @CurrentUser('id') actorId: string) {
+  async create(
+    @Body() dto: CreateStoreDto,
+    @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
+  ) {
     const store = this.storeRepository.create({ name: dto.name });
     const saved = await this.storeRepository.save(store);
-    await this.auditService.log(actorId, 'create_store', 'store', saved.id, {
-      name: saved.name,
-    });
+    await this.auditService.log(
+      actorId,
+      'create_store',
+      'store',
+      saved.id,
+      { name: saved.name },
+      traceId,
+    );
     return saved;
   }
 
@@ -81,6 +91,7 @@ export class StoresController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateStoreDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     const store = await this.storeRepository.findOne({ where: { id } });
     if (!store) {
@@ -90,9 +101,14 @@ export class StoresController {
       store.name = dto.name;
     }
     const saved = await this.storeRepository.save(store);
-    await this.auditService.log(actorId, 'update_store', 'store', id, {
-      fields: Object.keys(dto || {}),
-    });
+    await this.auditService.log(
+      actorId,
+      'update_store',
+      'store',
+      id,
+      { fields: Object.keys(dto || {}) },
+      traceId,
+    );
     return saved;
   }
 
@@ -105,12 +121,20 @@ export class StoresController {
   async remove(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     const store = await this.storeRepository.findOne({ where: { id } });
     if (!store) {
       throw new NotFoundException('Store not found');
     }
     await this.storeRepository.remove(store);
-    await this.auditService.log(actorId, 'delete_store', 'store', id);
+    await this.auditService.log(
+      actorId,
+      'delete_store',
+      'store',
+      id,
+      undefined,
+      traceId,
+    );
   }
 }

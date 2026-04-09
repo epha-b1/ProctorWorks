@@ -6,7 +6,7 @@ import {
   ForbiddenException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, LessThanOrEqual, MoreThanOrEqual, IsNull } from 'typeorm';
+import { DataSource, Repository, LessThanOrEqual, MoreThanOrEqual, IsNull } from 'typeorm';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { Promotion, PromotionType, DiscountType } from './entities/promotion.entity';
 import { Coupon, CouponStatus } from './entities/coupon.entity';
@@ -31,7 +31,33 @@ export class PromotionsService {
     private readonly couponRepo: Repository<Coupon>,
     @InjectRepository(CouponClaim)
     private readonly claimRepo: Repository<CouponClaim>,
+    private readonly dataSource: DataSource,
   ) {}
+
+  /**
+   * Asserts coupon is currently valid for issuance/redemption: ACTIVE,
+   * within time window, and (if capped) has remaining_quantity > 0.
+   * Throws BadRequestException so the caller surfaces a 400, distinct
+   * from NotFoundException used for tenant scoping.
+   */
+  private assertCouponUsable(coupon: Coupon, now: Date = new Date()): void {
+    if (coupon.status !== CouponStatus.ACTIVE) {
+      throw new BadRequestException(`Coupon is ${coupon.status}`);
+    }
+    if (coupon.starts_at && now < coupon.starts_at) {
+      throw new BadRequestException('Coupon is not yet active');
+    }
+    if (coupon.ends_at && now > coupon.ends_at) {
+      throw new BadRequestException('Coupon has expired');
+    }
+    if (
+      coupon.remaining_quantity !== null &&
+      coupon.remaining_quantity !== undefined &&
+      coupon.remaining_quantity <= 0
+    ) {
+      throw new BadRequestException('Coupon has no remaining quantity');
+    }
+  }
 
   private getUserStoreId(user: any): string | null {
     return user?.storeId ?? user?.store_id ?? null;
@@ -79,39 +105,36 @@ export class PromotionsService {
   }
 
   async claimCoupon(code: string, userId: string): Promise<CouponClaim> {
-    const coupon = await this.couponRepo.findOne({ where: { code } });
-    if (!coupon) {
-      throw new NotFoundException('Coupon not found');
-    }
+    return this.dataSource.transaction(async (manager) => {
+      const couponRepo = manager.getRepository(Coupon);
+      const claimRepo = manager.getRepository(CouponClaim);
 
-    if (coupon.status !== CouponStatus.ACTIVE) {
-      throw new BadRequestException(`Coupon is ${coupon.status}`);
-    }
-
-    const now = new Date();
-    if (coupon.starts_at && now < coupon.starts_at) {
-      throw new BadRequestException('Coupon is not yet active');
-    }
-    if (coupon.ends_at && now > coupon.ends_at) {
-      throw new BadRequestException('Coupon has expired');
-    }
-
-    const claim = this.claimRepo.create({
-      coupon_id: coupon.id,
-      user_id: userId,
-      claimed_at: now,
-    });
-    const savedClaim = await this.claimRepo.save(claim);
-
-    if (coupon.remaining_quantity !== null) {
-      coupon.remaining_quantity -= 1;
-      if (coupon.remaining_quantity <= 0) {
-        coupon.status = CouponStatus.EXHAUSTED;
+      const coupon = await couponRepo.findOne({ where: { code } });
+      if (!coupon) {
+        throw new NotFoundException('Coupon not found');
       }
-      await this.couponRepo.save(coupon);
-    }
 
-    return savedClaim;
+      this.assertCouponUsable(coupon);
+
+      const now = new Date();
+      const savedClaim = await claimRepo.save(
+        claimRepo.create({
+          coupon_id: coupon.id,
+          user_id: userId,
+          claimed_at: now,
+        }),
+      );
+
+      if (coupon.remaining_quantity !== null) {
+        coupon.remaining_quantity -= 1;
+        if (coupon.remaining_quantity <= 0) {
+          coupon.status = CouponStatus.EXHAUSTED;
+        }
+        await couponRepo.save(coupon);
+      }
+
+      return savedClaim;
+    });
   }
 
   async distributeCoupon(
@@ -119,22 +142,52 @@ export class PromotionsService {
     userIds: string[],
     user?: any,
   ): Promise<CouponClaim[]> {
-    const coupon = await this.couponRepo.findOne({ where: { id: couponId } });
-    if (!coupon) {
-      throw new NotFoundException('Coupon not found');
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      throw new BadRequestException('userIds must be a non-empty array');
     }
-    this.enforceCouponScope(coupon, user);
 
-    const now = new Date();
-    const claims = userIds.map((userId) =>
-      this.claimRepo.create({
-        coupon_id: couponId,
-        user_id: userId,
-        claimed_at: now,
-      }),
-    );
+    return this.dataSource.transaction(async (manager) => {
+      const couponRepo = manager.getRepository(Coupon);
+      const claimRepo = manager.getRepository(CouponClaim);
 
-    return this.claimRepo.save(claims);
+      const coupon = await couponRepo.findOne({ where: { id: couponId } });
+      if (!coupon) {
+        throw new NotFoundException('Coupon not found');
+      }
+      this.enforceCouponScope(coupon, user);
+
+      // Distribution must respect the same governance as direct claims:
+      // status, time window, and remaining quantity (must cover the batch).
+      this.assertCouponUsable(coupon);
+      if (
+        coupon.remaining_quantity !== null &&
+        coupon.remaining_quantity < userIds.length
+      ) {
+        throw new BadRequestException(
+          `Coupon has only ${coupon.remaining_quantity} remaining; cannot distribute to ${userIds.length} users`,
+        );
+      }
+
+      const now = new Date();
+      const claims = userIds.map((uid) =>
+        claimRepo.create({
+          coupon_id: couponId,
+          user_id: uid,
+          claimed_at: now,
+        }),
+      );
+      const saved = await claimRepo.save(claims);
+
+      if (coupon.remaining_quantity !== null) {
+        coupon.remaining_quantity -= userIds.length;
+        if (coupon.remaining_quantity <= 0) {
+          coupon.status = CouponStatus.EXHAUSTED;
+        }
+        await couponRepo.save(coupon);
+      }
+
+      return saved;
+    });
   }
 
   async redeemCoupon(
@@ -143,22 +196,59 @@ export class PromotionsService {
     orderId: string,
     user?: any,
   ): Promise<CouponClaim> {
-    const coupon = await this.couponRepo.findOne({ where: { code } });
-    if (!coupon) {
-      throw new NotFoundException('Coupon not found');
-    }
-    this.enforceCouponScope(coupon, user);
+    return this.dataSource.transaction(async (manager) => {
+      const couponRepo = manager.getRepository(Coupon);
+      const claimRepo = manager.getRepository(CouponClaim);
+      const promotionRepo = manager.getRepository(Promotion);
 
-    const claim = await this.claimRepo.findOne({
-      where: { coupon_id: coupon.id, user_id: userId, redeemed_at: IsNull() },
+      const coupon = await couponRepo.findOne({ where: { code } });
+      if (!coupon) {
+        throw new NotFoundException('Coupon not found');
+      }
+      this.enforceCouponScope(coupon, user);
+
+      // A redemption must respect status + time window. Quantity is not
+      // checked here because the claim has already drawn from the pool.
+      if (coupon.status === CouponStatus.EXPIRED) {
+        throw new BadRequestException('Coupon is expired');
+      }
+      const now = new Date();
+      if (coupon.starts_at && now < coupon.starts_at) {
+        throw new BadRequestException('Coupon is not yet active');
+      }
+      if (coupon.ends_at && now > coupon.ends_at) {
+        throw new BadRequestException('Coupon has expired');
+      }
+
+      const claim = await claimRepo.findOne({
+        where: { coupon_id: coupon.id, user_id: userId, redeemed_at: IsNull() },
+      });
+      if (!claim) {
+        throw new NotFoundException('No unredeemed claim found for this user');
+      }
+
+      // Atomically enforce promotion redemption cap and bump count in
+      // the same UPDATE so concurrent redemptions can't exceed the cap.
+      const updateResult = await promotionRepo
+        .createQueryBuilder()
+        .update(Promotion)
+        .set({ redemption_count: () => 'redemption_count + 1' })
+        .where('id = :id', { id: coupon.promotion_id })
+        .andWhere(
+          '(redemption_cap IS NULL OR redemption_count < redemption_cap)',
+        )
+        .execute();
+
+      if (!updateResult.affected || updateResult.affected === 0) {
+        throw new BadRequestException(
+          'Promotion redemption cap reached',
+        );
+      }
+
+      claim.redeemed_at = now;
+      claim.order_id = orderId;
+      return claimRepo.save(claim);
     });
-    if (!claim) {
-      throw new NotFoundException('No unredeemed claim found for this user');
-    }
-
-    claim.redeemed_at = new Date();
-    claim.order_id = orderId;
-    return this.claimRepo.save(claim);
   }
 
   async expireCoupon(id: string, user?: any): Promise<Coupon> {

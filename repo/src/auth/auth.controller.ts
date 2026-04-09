@@ -10,6 +10,7 @@ import {
   ParseUUIDPipe,
   HttpCode,
   HttpStatus,
+  Req,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -27,6 +28,7 @@ import { ChangePasswordDto } from './dto/change-password.dto';
 import { Public } from '../common/decorators/public.decorator';
 import { Roles } from '../common/decorators/roles.decorator';
 import { CurrentUser } from '../common/decorators/current-user.decorator';
+import { TraceId } from '../common/decorators/trace-id.decorator';
 import { UserRole } from './entities/user.entity';
 
 @ApiTags('auth')
@@ -43,9 +45,25 @@ export class AuthController {
   @ApiOperation({ summary: 'User login' })
   @ApiResponse({ status: 200, description: 'Login successful' })
   @ApiResponse({ status: 401, description: 'Invalid credentials or locked' })
-  async login(@Body() dto: LoginDto) {
-    const result = await this.authService.login(dto.username, dto.password);
-    await this.auditService.log(result.user.id, 'login', 'user', result.user.id);
+  async login(@Body() dto: LoginDto, @Req() req: any, @TraceId() traceId?: string) {
+    const ipAddress =
+      (req.headers?.['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+      req.ip ||
+      req.socket?.remoteAddress ||
+      undefined;
+    const userAgent = (req.headers?.['user-agent'] as string) || undefined;
+    const result = await this.authService.login(dto.username, dto.password, {
+      ipAddress,
+      userAgent,
+    });
+    await this.auditService.log(
+      result.user.id,
+      'login',
+      'user',
+      result.user.id,
+      undefined,
+      traceId,
+    );
     return result;
   }
 
@@ -54,8 +72,16 @@ export class AuthController {
   @ApiBearerAuth()
   @ApiOperation({ summary: 'Logout — invalidates current JWT' })
   @ApiResponse({ status: 204, description: 'Logged out' })
-  async logout(@CurrentUser('id') userId: string) {
-    await this.auditService.log(userId, 'logout', 'user', userId);
+  async logout(@CurrentUser() user: any, @TraceId() traceId?: string) {
+    await this.authService.logout(user.id, user.jti);
+    await this.auditService.log(
+      user.id,
+      'logout',
+      'user',
+      user.id,
+      undefined,
+      traceId,
+    );
     return;
   }
 
@@ -75,13 +101,21 @@ export class AuthController {
   async changePassword(
     @CurrentUser('id') userId: string,
     @Body() dto: ChangePasswordDto,
+    @TraceId() traceId?: string,
   ) {
     await this.authService.changePassword(
       userId,
       dto.currentPassword,
       dto.newPassword,
     );
-    await this.auditService.log(userId, 'change_password', 'user', userId);
+    await this.auditService.log(
+      userId,
+      'change_password',
+      'user',
+      userId,
+      undefined,
+      traceId,
+    );
     return { message: 'Password changed successfully' };
   }
 }
@@ -116,12 +150,23 @@ export class UsersController {
   @ApiOperation({ summary: 'Create a new user (platform_admin only)' })
   @ApiResponse({ status: 201, description: 'User created' })
   @ApiResponse({ status: 409, description: 'Username already exists' })
-  async create(@Body() dto: CreateUserDto, @CurrentUser('id') actorId: string) {
+  async create(
+    @Body() dto: CreateUserDto,
+    @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
+  ) {
     const created = await this.authService.createUser(dto);
-    await this.auditService.log(actorId, 'create_user', 'user', created.id, {
-      role: created.role,
-      storeId: created.store_id ?? null,
-    });
+    await this.auditService.log(
+      actorId,
+      'create_user',
+      'user',
+      created.id,
+      {
+        role: created.role,
+        storeId: created.store_id ?? null,
+      },
+      traceId,
+    );
     return created;
   }
 
@@ -143,11 +188,17 @@ export class UsersController {
     @Param('id', ParseUUIDPipe) id: string,
     @Body() dto: UpdateUserDto,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     return this.authService.updateUser(id, dto).then(async (updated) => {
-      await this.auditService.log(actorId, 'update_user', 'user', id, {
-        fields: Object.keys(dto || {}),
-      });
+      await this.auditService.log(
+        actorId,
+        'update_user',
+        'user',
+        id,
+        { fields: Object.keys(dto || {}) },
+        traceId,
+      );
       return updated;
     });
   }
@@ -161,9 +212,17 @@ export class UsersController {
   async remove(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser('id') actorId: string,
+    @TraceId() traceId?: string,
   ) {
     await this.authService.deleteUser(id);
-    await this.auditService.log(actorId, 'delete_user', 'user', id);
+    await this.auditService.log(
+      actorId,
+      'delete_user',
+      'user',
+      id,
+      undefined,
+      traceId,
+    );
     return;
   }
 }

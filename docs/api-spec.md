@@ -855,12 +855,19 @@ paths:
     get:
       tags: [Assessments]
       summary: List papers
+      description: |
+        Allowed roles: platform_admin, store_admin, content_reviewer, auditor (read-only).
       responses:
         "200":
           description: Papers
+        "403":
+          description: Role not permitted
     post:
       tags: [Assessments]
       summary: Generate paper
+      description: |
+        Allowed roles: platform_admin, store_admin, content_reviewer.
+        auditor is denied with 403 (read-only role).
       requestBody:
         required: true
         content:
@@ -879,11 +886,16 @@ paths:
       responses:
         "201":
           description: Paper created
+        "403":
+          description: Role not permitted
 
   /attempts:
     post:
       tags: [Assessments]
       summary: Start attempt
+      description: |
+        Allowed roles: platform_admin, store_admin, content_reviewer.
+        auditor is denied with 403 (read-only role).
       requestBody:
         required: true
         content:
@@ -898,11 +910,16 @@ paths:
       responses:
         "201":
           description: Attempt started
+        "403":
+          description: Role not permitted
 
   /attempts/{id}/submit:
     post:
       tags: [Assessments]
       summary: Submit attempt with answers
+      description: |
+        Allowed roles: platform_admin, store_admin, content_reviewer.
+        auditor is denied with 403 (read-only role).
       parameters:
         - in: path
           name: id
@@ -932,13 +949,18 @@ paths:
                       textAnswer:
                         type: string
       responses:
-        "200":
+        "201":
           description: Graded result
+        "403":
+          description: Role not permitted
 
   /attempts/{id}/redo:
     post:
       tags: [Assessments]
       summary: Redo attempt (new attempt from same paper, preserves prior)
+      description: |
+        Allowed roles: platform_admin, store_admin, content_reviewer.
+        auditor is denied with 403 (read-only role).
       parameters:
         - in: path
           name: id
@@ -949,11 +971,15 @@ paths:
       responses:
         "201":
           description: New attempt created
+        "403":
+          description: Role not permitted
 
   /attempts/history:
     get:
       tags: [Assessments]
       summary: Practice history for current user
+      description: |
+        Allowed roles: platform_admin, store_admin, content_reviewer, auditor (read-only).
       responses:
         "200":
           description: Attempt history

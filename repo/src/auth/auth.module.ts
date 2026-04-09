@@ -12,12 +12,14 @@ import { JwtAuthGuard } from './guards/jwt-auth.guard';
 import { RolesGuard } from '../common/guards/roles.guard';
 import { User } from './entities/user.entity';
 import { Store } from './entities/store.entity';
+import { Session } from '../sessions/entities/session.entity';
+import { SessionsService } from '../sessions/sessions.service';
 import { AuditModule } from '../audit/audit.module';
 import { EncryptionService } from '../common/encryption.service';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([User, Store]),
+    TypeOrmModule.forFeature([User, Store, Session]),
     AuditModule,
     PassportModule.register({ defaultStrategy: 'jwt' }),
     JwtModule.registerAsync({
@@ -34,6 +36,7 @@ import { EncryptionService } from '../common/encryption.service';
   controllers: [AuthController, UsersController, StoresController],
   providers: [
     AuthService,
+    SessionsService,
     EncryptionService,
     JwtStrategy,
     {
@@ -45,6 +48,6 @@ import { EncryptionService } from '../common/encryption.service';
       useClass: RolesGuard,
     },
   ],
-  exports: [AuthService, JwtModule],
+  exports: [AuthService, SessionsService, JwtModule],
 })
 export class AuthModule {}

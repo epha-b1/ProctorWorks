@@ -67,13 +67,31 @@ function createService() {
   const couponRepo = mockRepository();
   const claimRepo = mockRepository();
 
+  // Mock DataSource: route .transaction() through a fake EntityManager
+  // that delegates getRepository() back to the same repo doubles, so
+  // service code that uses manager.getRepository(X) sees the same mocks
+  // unit tests are configuring directly.
+  const fakeManager = {
+    getRepository: (entity: any) => {
+      const name = (entity?.name ?? entity)?.toString();
+      if (name?.includes('Promotion')) return promotionRepo;
+      if (name?.includes('CouponClaim')) return claimRepo;
+      if (name?.includes('Coupon')) return couponRepo;
+      return promotionRepo;
+    },
+  };
+  const dataSource = {
+    transaction: jest.fn(async (cb: any) => cb(fakeManager)),
+  };
+
   const service = new PromotionsService(
     promotionRepo as any,
     couponRepo as any,
     claimRepo as any,
+    dataSource as any,
   );
 
-  return { service, promotionRepo, couponRepo, claimRepo };
+  return { service, promotionRepo, couponRepo, claimRepo, dataSource };
 }
 
 /* ================================================================== */
@@ -475,6 +493,193 @@ describe('PromotionsService', () => {
       expect(couponRepo.save).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'coupon-own', status: CouponStatus.EXPIRED }),
       );
+    });
+  });
+
+  /* -------------------------------------------------------------- */
+  /*  17. F-04 governance: distribute / redeem checks + counter      */
+  /* -------------------------------------------------------------- */
+  describe('coupon governance (F-04)', () => {
+    describe('distributeCoupon', () => {
+      it('rejects expired coupon', async () => {
+        const { service, couponRepo } = createService();
+        couponRepo.findOne.mockResolvedValue(
+          makeCoupon({ status: CouponStatus.EXPIRED }),
+        );
+
+        await expect(
+          service.distributeCoupon('coupon-1', ['u1'], { role: 'platform_admin' }),
+        ).rejects.toThrow(BadRequestException);
+      });
+
+      it('rejects exhausted coupon', async () => {
+        const { service, couponRepo } = createService();
+        couponRepo.findOne.mockResolvedValue(
+          makeCoupon({ status: CouponStatus.EXHAUSTED }),
+        );
+
+        await expect(
+          service.distributeCoupon('coupon-1', ['u1'], { role: 'platform_admin' }),
+        ).rejects.toThrow(BadRequestException);
+      });
+
+      it('rejects coupon outside its time window (not yet active)', async () => {
+        const { service, couponRepo } = createService();
+        const future = new Date(Date.now() + 24 * 3600 * 1000);
+        couponRepo.findOne.mockResolvedValue(
+          makeCoupon({ starts_at: future }),
+        );
+
+        await expect(
+          service.distributeCoupon('coupon-1', ['u1'], { role: 'platform_admin' }),
+        ).rejects.toThrow(BadRequestException);
+      });
+
+      it('rejects coupon outside its time window (already ended)', async () => {
+        const { service, couponRepo } = createService();
+        const past = new Date(Date.now() - 24 * 3600 * 1000);
+        couponRepo.findOne.mockResolvedValue(makeCoupon({ ends_at: past }));
+
+        await expect(
+          service.distributeCoupon('coupon-1', ['u1'], { role: 'platform_admin' }),
+        ).rejects.toThrow(BadRequestException);
+      });
+
+      it('rejects when remaining quantity cannot cover the recipient batch', async () => {
+        const { service, couponRepo } = createService();
+        couponRepo.findOne.mockResolvedValue(
+          makeCoupon({ remaining_quantity: 2 }),
+        );
+
+        await expect(
+          service.distributeCoupon(
+            'coupon-1',
+            ['u1', 'u2', 'u3'],
+            { role: 'platform_admin' },
+          ),
+        ).rejects.toThrow(BadRequestException);
+      });
+
+      it('decrements remaining_quantity by recipient count and saves', async () => {
+        const { service, couponRepo, claimRepo } = createService();
+        const coupon = makeCoupon({ remaining_quantity: 5 });
+        couponRepo.findOne.mockResolvedValue(coupon);
+        claimRepo.save.mockResolvedValue([{ id: 'c1' }, { id: 'c2' }]);
+
+        await service.distributeCoupon(
+          'coupon-1',
+          ['u1', 'u2'],
+          { role: 'platform_admin' },
+        );
+
+        expect(coupon.remaining_quantity).toBe(3);
+        expect(couponRepo.save).toHaveBeenCalledWith(
+          expect.objectContaining({ remaining_quantity: 3 }),
+        );
+      });
+
+      it('flips status to EXHAUSTED when distribution drains the pool', async () => {
+        const { service, couponRepo, claimRepo } = createService();
+        const coupon = makeCoupon({ remaining_quantity: 2 });
+        couponRepo.findOne.mockResolvedValue(coupon);
+        claimRepo.save.mockResolvedValue([{ id: 'c1' }, { id: 'c2' }]);
+
+        await service.distributeCoupon(
+          'coupon-1',
+          ['u1', 'u2'],
+          { role: 'platform_admin' },
+        );
+
+        expect(coupon.status).toBe(CouponStatus.EXHAUSTED);
+      });
+    });
+
+    describe('redeemCoupon', () => {
+      function setupRedeem(opts: {
+        coupon: Partial<Coupon>;
+        existingClaim?: any;
+        cappedUpdateAffected?: number;
+      }) {
+        const ctx = createService();
+        const coupon = makeCoupon({
+          promotion_id: 'promo-1',
+          ...opts.coupon,
+        });
+        ctx.couponRepo.findOne.mockResolvedValue(coupon);
+        ctx.claimRepo.findOne.mockResolvedValue(
+          opts.existingClaim ?? { id: 'claim-1', coupon_id: coupon.id, user_id: 'u1', redeemed_at: null, order_id: null },
+        );
+        ctx.claimRepo.save.mockImplementation((c: any) => Promise.resolve(c));
+        const updateExecute = jest
+          .fn()
+          .mockResolvedValue({ affected: opts.cappedUpdateAffected ?? 1 });
+        ctx.promotionRepo.createQueryBuilder.mockReturnValue({
+          update: jest.fn().mockReturnThis(),
+          set: jest.fn().mockReturnThis(),
+          where: jest.fn().mockReturnThis(),
+          andWhere: jest.fn().mockReturnThis(),
+          execute: updateExecute,
+        });
+        return { ...ctx, coupon, updateExecute };
+      }
+
+      it('rejects when coupon already expired', async () => {
+        const { service } = setupRedeem({
+          coupon: { status: CouponStatus.EXPIRED },
+        });
+        await expect(
+          service.redeemCoupon('SAVE10', 'u1', 'order-1', { role: 'platform_admin' }),
+        ).rejects.toThrow(BadRequestException);
+      });
+
+      it('rejects when coupon time window has ended', async () => {
+        const { service } = setupRedeem({
+          coupon: { ends_at: new Date(Date.now() - 1000) },
+        });
+        await expect(
+          service.redeemCoupon('SAVE10', 'u1', 'order-1', { role: 'platform_admin' }),
+        ).rejects.toThrow(BadRequestException);
+      });
+
+      it('rejects when no unredeemed claim exists for the user', async () => {
+        const ctx = createService();
+        ctx.couponRepo.findOne.mockResolvedValue(makeCoupon());
+        ctx.claimRepo.findOne.mockResolvedValue(null);
+        await expect(
+          ctx.service.redeemCoupon('SAVE10', 'u1', 'order-1', { role: 'platform_admin' }),
+        ).rejects.toThrow(NotFoundException);
+      });
+
+      it('atomically increments redemption_count and marks claim redeemed', async () => {
+        const { service, updateExecute, claimRepo } = setupRedeem({
+          coupon: {},
+        });
+        await service.redeemCoupon('SAVE10', 'u1', 'order-99', {
+          role: 'platform_admin',
+        });
+
+        // Atomic UPDATE was issued — that's what bumps the count.
+        expect(updateExecute).toHaveBeenCalled();
+        // Claim was marked redeemed with the order id.
+        expect(claimRepo.save).toHaveBeenCalledWith(
+          expect.objectContaining({
+            redeemed_at: expect.any(Date),
+            order_id: 'order-99',
+          }),
+        );
+      });
+
+      it('rejects when promotion redemption cap is already at the limit', async () => {
+        // 0 rows updated → cap was reached, the SET is guarded by the
+        // andWhere(redemption_count < redemption_cap).
+        const { service } = setupRedeem({
+          coupon: {},
+          cappedUpdateAffected: 0,
+        });
+        await expect(
+          service.redeemCoupon('SAVE10', 'u1', 'order-1', { role: 'platform_admin' }),
+        ).rejects.toThrow(BadRequestException);
+      });
     });
   });
 });

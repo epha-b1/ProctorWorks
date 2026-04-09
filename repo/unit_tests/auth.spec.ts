@@ -54,8 +54,28 @@ function createMockConfigService() {
   return {
     get: jest.fn((key: string, defaultVal?: any) => {
       if (key === 'bcrypt.rounds') return 10;
+      if (key === 'jwt.expiry') return '8h';
       return defaultVal;
     }),
+  };
+}
+
+function createMockEncryptionService() {
+  return {
+    encrypt: jest.fn((s: string) => `enc:${s}`),
+    decrypt: jest.fn((s: string) => s.replace(/^enc:/, '')),
+    isEncrypted: jest.fn(() => false),
+  };
+}
+
+function createMockSessionsService() {
+  return {
+    createForJti: jest.fn().mockResolvedValue({ id: 'sess-1' }),
+    findActiveByJti: jest.fn().mockResolvedValue({ id: 'sess-1' }),
+    assertActive: jest.fn().mockResolvedValue(undefined),
+    invalidateByJti: jest.fn().mockResolvedValue(undefined),
+    invalidateAllForUser: jest.fn().mockResolvedValue(undefined),
+    purgeExpired: jest.fn().mockResolvedValue(0),
   };
 }
 
@@ -68,16 +88,22 @@ describe('AuthService', () => {
   let userRepo: ReturnType<typeof createMockRepository>;
   let jwtService: ReturnType<typeof createMockJwtService>;
   let configService: ReturnType<typeof createMockConfigService>;
+  let encryptionService: ReturnType<typeof createMockEncryptionService>;
+  let sessionsService: ReturnType<typeof createMockSessionsService>;
 
   beforeEach(() => {
     userRepo = createMockRepository();
     jwtService = createMockJwtService();
     configService = createMockConfigService();
+    encryptionService = createMockEncryptionService();
+    sessionsService = createMockSessionsService();
 
     service = new AuthService(
       userRepo as any,
       jwtService as any,
       configService as any,
+      encryptionService as any,
+      sessionsService as any,
     );
   });
 
@@ -139,7 +165,16 @@ describe('AuthService', () => {
           username: user.username,
           role: user.role,
           storeId: user.store_id,
+          jti: expect.any(String),
         }),
+      );
+      // A session row was persisted for the issued JWT (F-03).
+      expect(sessionsService.createForJti).toHaveBeenCalledWith(
+        user.id,
+        expect.any(String),
+        expect.any(Date),
+        undefined,
+        undefined,
       );
     });
 

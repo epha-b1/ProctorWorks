@@ -133,14 +133,43 @@ describe('Auth & Users API', () => {
   // POST /auth/logout
   // -----------------------------------------------------------------------
   describe('POST /auth/logout', () => {
+    // Use a disposable user/token here so the shared adminToken survives
+    // for the rest of this suite — F-03 makes logout actually invalidate
+    // the JWT it was called with, so reusing adminToken would 401 every
+    // subsequent test.
+    let logoutUser: string;
+    let logoutToken: string;
+
+    beforeAll(async () => {
+      logoutUser = `logoutuser_${UNIQUE}`;
+      await request(server)
+        .post('/users')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          username: logoutUser,
+          password: 'Logout1234!',
+          role: 'store_admin',
+        });
+      logoutToken = await login(server, logoutUser, 'Logout1234!');
+    });
+
     it('should return 204 and log audit entry', async () => {
       logStep('POST', '/auth/logout');
       const res = await request(server)
         .post('/auth/logout')
-        .set('Authorization', `Bearer ${adminToken}`);
+        .set('Authorization', `Bearer ${logoutToken}`);
       logStep('POST', '/auth/logout', res.status);
 
       expect(res.status).toBe(204);
+    });
+
+    it('subsequent requests with the same token are rejected (F-03)', async () => {
+      // The logout above flipped the session row inactive. Hitting any
+      // protected endpoint with the same JWT must now produce a 401.
+      const res = await request(server)
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${logoutToken}`);
+      expect(res.status).toBe(401);
     });
   });
 
