@@ -344,4 +344,114 @@ describe('Inventory API', () => {
       expect(lot.quantity).toBe(expectedQuantity);
     });
   });
+
+  // -------------------------------------------------------------------------
+  // 11. Concurrency safety: N parallel /inventory/adjust requests with the
+  //     same idempotencyKey must mutate quantity exactly once.
+  //
+  //     This is the race-condition guard. Without row-level locking + an
+  //     atomic idempotency-key check, two callers could both pass the
+  //     pre-check, both apply the delta, then one would lose the unique
+  //     insert — leaving the lot quantity drifted by `delta * (winners - 1)`.
+  // -------------------------------------------------------------------------
+  describe('POST /inventory/adjust — concurrent duplicate requests', () => {
+    it('applies the delta exactly once across N concurrent requests sharing an idempotencyKey', async () => {
+      // 1. Provision a fresh lot with a known starting quantity so this test
+      //    is independent of the adjustments performed in the suite above.
+      const startingQuantity = 200;
+      const concurrentCallers = 6;
+      const delta = 7;
+      const idempotencyKey = `adj-race-${UNIQUE}`;
+
+      logStep('POST', '/inventory/lots (race lot)');
+      const lotRes = await request(server)
+        .post('/inventory/lots')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          skuId,
+          batchCode: `BATCH-RACE-${UNIQUE}`,
+          quantity: startingQuantity,
+          expirationDate: '2027-12-31',
+        });
+      logStep('POST', '/inventory/lots (race lot)', lotRes.status);
+      expect(lotRes.status).toBe(201);
+      const raceLotId = lotRes.body.id;
+
+      // 2. Fire N concurrent /inventory/adjust requests sharing the same
+      //    idempotencyKey and same delta.
+      logStep('POST', `/inventory/adjust x${concurrentCallers} (race)`);
+      const responses = await Promise.all(
+        Array.from({ length: concurrentCallers }, () =>
+          request(server)
+            .post('/inventory/adjust')
+            .set('Authorization', `Bearer ${adminToken}`)
+            .send({
+              lotId: raceLotId,
+              delta,
+              reasonCode: 'restock',
+              idempotencyKey,
+            }),
+        ),
+      );
+      logStep(
+        'POST',
+        `/inventory/adjust x${concurrentCallers} (race)`,
+        responses.map((r) => r.status).join(','),
+      );
+
+      // 3a. Every response succeeded (no 5xx, no aborted transactions).
+      for (const r of responses) {
+        expect([200, 201]).toContain(r.status);
+      }
+
+      // 3b. Exactly one caller created the row, the rest got idempotent replays.
+      const created = responses.filter((r) => r.status === 201);
+      const replayed = responses.filter((r) => r.status === 200);
+      expect(created).toHaveLength(1);
+      expect(replayed).toHaveLength(concurrentCallers - 1);
+
+      // 3c. All responses point at the same adjustment row (one row total).
+      const adjustmentIds = new Set(responses.map((r) => r.body.id));
+      expect(adjustmentIds.size).toBe(1);
+      for (const r of responses) {
+        expect(r.body.idempotency_key).toBe(idempotencyKey);
+        expect(r.body.delta).toBe(delta);
+        expect(r.body.lot_id).toBe(raceLotId);
+      }
+
+      // 3d. Lot quantity moved by exactly ONE delta — not by `delta * N`.
+      logStep('GET', `/inventory/lots?skuId=${skuId} (race verify)`);
+      const verifyRes = await request(server)
+        .get('/inventory/lots')
+        .query({ skuId })
+        .set('Authorization', `Bearer ${adminToken}`);
+      logStep('GET', `/inventory/lots?skuId=${skuId} (race verify)`, verifyRes.status);
+      expect(verifyRes.status).toBe(200);
+      const raceLot = verifyRes.body.find((l: any) => l.id === raceLotId);
+      expect(raceLot).toBeDefined();
+      expect(raceLot.quantity).toBe(startingQuantity + delta);
+
+      // 3e. A subsequent serial replay with the same key is still a no-op.
+      logStep('POST', '/inventory/adjust (post-race replay)');
+      const replayRes = await request(server)
+        .post('/inventory/adjust')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          lotId: raceLotId,
+          delta,
+          reasonCode: 'restock',
+          idempotencyKey,
+        });
+      logStep('POST', '/inventory/adjust (post-race replay)', replayRes.status);
+      expect(replayRes.status).toBe(200);
+      expect(replayRes.body.id).toBe([...adjustmentIds][0]);
+
+      const finalRes = await request(server)
+        .get('/inventory/lots')
+        .query({ skuId })
+        .set('Authorization', `Bearer ${adminToken}`);
+      const finalRaceLot = finalRes.body.find((l: any) => l.id === raceLotId);
+      expect(finalRaceLot.quantity).toBe(startingQuantity + delta);
+    }, 30_000);
+  });
 });
