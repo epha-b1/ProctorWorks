@@ -508,6 +508,487 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
+  // F-P5: Publish flow requires explicit reviewer approval
+  //
+  // audit_report-1 §5.5 — content_reviewer / platform_admin used to be
+  // able to flip a product straight to PUBLISHED via /publish, skipping
+  // the explicit reviewer-approval decision the prompt's governance
+  // model requires. The fix routes EVERY publish request through
+  // pending_review and exposes a separate /approve action that the
+  // reviewer must explicitly call. This block proves both halves:
+  //   - the bypass is closed (publish never lands on 'published')
+  //   - approve is the only path to 'published' and it requires
+  //     pending_review state.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('F-P5: Publish requires explicit reviewer approval', () => {
+    let pubCategoryId: string;
+    let pubBrandId: string;
+    let productInStoreA: string;
+
+    beforeAll(async () => {
+      const cat = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `PubCat-${U}` });
+      pubCategoryId = cat.body.id;
+
+      const brand = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `PubBrand-${U}` });
+      pubBrandId = brand.body.id;
+
+      // store_admin A creates a product (DRAFT). This becomes the
+      // single product the rest of the test transitions through the
+      // governance lifecycle.
+      const p = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          name: `PubProd-${U}`,
+          categoryId: pubCategoryId,
+          brandId: pubBrandId,
+        });
+      expect(p.status).toBe(201);
+      productInStoreA = p.body.id;
+    }, 30_000);
+
+    it('store_admin /publish lands on pending_review (not published)', async () => {
+      const res = await request(server)
+        .post(`/products/${productInStoreA}/publish`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`);
+      expect([200, 201]).toContain(res.status);
+      expect(res.body.status).toBe('pending_review');
+    });
+
+    it('platform_admin /publish ALSO lands on pending_review (no bypass)', async () => {
+      // Create a second product so we can hit /publish on something
+      // that's not yet in pending_review.
+      const p = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          name: `PubProd-bypass-${U}`,
+          categoryId: pubCategoryId,
+          brandId: pubBrandId,
+        });
+      const id = p.body.id;
+
+      const res = await request(server)
+        .post(`/products/${id}/publish`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect([200, 201]).toContain(res.status);
+      // Critical: the previous behaviour would have been 'published'.
+      // The bypass is now closed.
+      expect(res.body.status).toBe('pending_review');
+    });
+
+    it('content_reviewer /approve transitions pending_review → published', async () => {
+      const res = await request(server)
+        .post(`/products/${productInStoreA}/approve`)
+        .set('Authorization', `Bearer ${reviewerToken}`);
+      expect([200, 201]).toContain(res.status);
+      expect(res.body.status).toBe('published');
+    });
+
+    it('store_admin cannot /approve a product (only reviewers can) → 403', async () => {
+      const p = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          name: `PubProd-noapprove-${U}`,
+          categoryId: pubCategoryId,
+          brandId: pubBrandId,
+        });
+      const id = p.body.id;
+
+      // Submit it to pending_review first.
+      await request(server)
+        .post(`/products/${id}/publish`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`);
+
+      // store_admin cannot approve their own submission.
+      const res = await request(server)
+        .post(`/products/${id}/approve`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`);
+      expect(res.status).toBe(403);
+    });
+
+    it('approving a product that is NOT in pending_review → 409', async () => {
+      // The product we just published is now PUBLISHED. Approving
+      // again must hit the conflict guard, not silently no-op.
+      const res = await request(server)
+        .post(`/products/${productInStoreA}/approve`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(res.status).toBe(409);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // F-P4: Order idempotency lookup must NOT leak across tenant scope
+  //
+  // audit_report-1 §5.4 — the original lookup was global by `key`, so
+  // a caller in store B reusing a key already issued by an actor in
+  // store A would be served the prior order from store A (cross-tenant
+  // data leak via predictable key). The fix scopes the lookup by
+  // (operation_type, actor_id, store_id, key). This test verifies the
+  // contract end-to-end by:
+  //   1. having store_admin A create an order with a known key,
+  //   2. having store_admin B POST a brand-new order with the SAME key,
+  //   3. asserting B's order is genuinely fresh (different id, store=B,
+  //      no fields from A's order leak through).
+  // ──────────────────────────────────────────────────────────────────────
+  describe('F-P4: Order idempotency cross-tenant non-leakage', () => {
+    let skuA: string;
+    let skuB: string;
+
+    beforeAll(async () => {
+      // Each store needs at least one SKU so its store_admin can place
+      // an order. We deliberately make A and B's prices distinct so a
+      // leak (same response served back) is loud in the assertions.
+      const cat = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `IdemCat-${U}` });
+      const brand = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `IdemBrand-${U}` });
+
+      const prodA = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          name: `IdemProdA-${U}`,
+          categoryId: cat.body.id,
+          brandId: brand.body.id,
+        });
+      const sA = await request(server)
+        .post(`/products/${prodA.body.id}/skus`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({ skuCode: `IDEM-A-${U}`, priceCents: 7_777 });
+      skuA = sA.body.id;
+
+      const prodB = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          name: `IdemProdB-${U}`,
+          categoryId: cat.body.id,
+          brandId: brand.body.id,
+        });
+      const sB = await request(server)
+        .post(`/products/${prodB.body.id}/skus`)
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({ skuCode: `IDEM-B-${U}`, priceCents: 1_111 });
+      skuB = sB.body.id;
+    }, 30_000);
+
+    it('same idempotency key in two tenants resolves to two distinct orders', async () => {
+      const sharedKey = `cross-tenant-idem-${U}`;
+
+      // 1. Store A creates an order with the shared key.
+      const aRes = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          idempotencyKey: sharedKey,
+          items: [{ skuId: skuA, quantity: 1 }],
+        });
+      expect(aRes.status).toBe(201);
+      expect(aRes.body.store_id).toBe(storeA.id);
+      expect(aRes.body.total_cents).toBe(7_777);
+      const orderAId = aRes.body.id;
+
+      // 2. Store B uses the EXACT same idempotency key.
+      const bRes = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          idempotencyKey: sharedKey,
+          items: [{ skuId: skuB, quantity: 1 }],
+        });
+      expect(bRes.status).toBe(201);
+
+      // 3. Critical: store B must get its OWN fresh order, not store A's.
+      expect(bRes.body.id).not.toBe(orderAId);
+      expect(bRes.body.store_id).toBe(storeB.id);
+      expect(bRes.body.total_cents).toBe(1_111);
+
+      // 4. Re-issuing the key inside the SAME tenant must still dedupe.
+      //    This is the same-scope replay path; it must continue to work.
+      const aReplay = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          idempotencyKey: sharedKey,
+          items: [{ skuId: skuA, quantity: 1 }],
+        });
+      expect([200, 201]).toContain(aReplay.status);
+      expect(aReplay.body.id).toBe(orderAId);
+      expect(aReplay.body.store_id).toBe(storeA.id);
+
+      const bReplay = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          idempotencyKey: sharedKey,
+          items: [{ skuId: skuB, quantity: 1 }],
+        });
+      expect([200, 201]).toContain(bReplay.status);
+      expect(bReplay.body.id).toBe(bRes.body.id);
+      expect(bReplay.body.store_id).toBe(storeB.id);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // F-P3: Order promotion resolution must reject cross-store coupons
+  //
+  // audit_report-1 §5.3 — `resolvePromotions` previously looked up a
+  // coupon by code only and applied it without checking that the
+  // coupon's `store_id` matched the order's store. That allowed a
+  // store_admin in store B to redeem a coupon issued in store A,
+  // breaking tenant isolation and enabling cross-store discount abuse.
+  //
+  // The fix is enforced inside `resolvePromotions` itself; this test
+  // exercises the full HTTP path so any regression that re-introduces
+  // the unscoped lookup is caught at the contract layer.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('F-P3: Order promotion cross-store coupon binding', () => {
+    let storeAProductSkuId: string;
+    let storeBProductSkuId: string;
+    const localCouponCode = `LOCAL-${U}`;
+    const foreignCouponCode = `FOREIGN-${U}`;
+
+    beforeAll(async () => {
+      // Create catalog so each store_admin can place orders against
+      // their own SKU. The orders service derives `store_id` from the
+      // caller's JWT, so the SKU's product store doesn't have to match
+      // — but we keep them aligned for realism.
+      const catA = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `CrossCatA-${U}` });
+      const brandA = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `CrossBrandA-${U}` });
+      const prodA = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          name: `CrossProdA-${U}`,
+          categoryId: catA.body.id,
+          brandId: brandA.body.id,
+        });
+      const skuA = await request(server)
+        .post(`/products/${prodA.body.id}/skus`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({ skuCode: `CROSS-A-${U}`, priceCents: 10_000 });
+      storeAProductSkuId = skuA.body.id;
+
+      const prodB = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          name: `CrossProdB-${U}`,
+          categoryId: catA.body.id,
+          brandId: brandA.body.id,
+        });
+      const skuB = await request(server)
+        .post(`/products/${prodB.body.id}/skus`)
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({ skuCode: `CROSS-B-${U}`, priceCents: 10_000 });
+      storeBProductSkuId = skuB.body.id;
+
+      // Promotion + coupon LIVING IN STORE A. The fixed-cents discount
+      // is generous on purpose so any cross-store leakage shows up
+      // immediately in the order total.
+      const promoA = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeA.id,
+          name: `CrossPromoA-${U}`,
+          type: 'threshold',
+          priority: 100,
+          discountType: 'fixed_cents',
+          discountValue: 4_000,
+        });
+      await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeA.id,
+          code: foreignCouponCode,
+          promotionId: promoA.body.id,
+          remainingQuantity: 100,
+        });
+
+      // Local promotion + coupon for store B so we can sanity-check
+      // that the same code path still applies a same-store coupon.
+      const promoB = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeB.id,
+          name: `CrossPromoB-${U}`,
+          type: 'threshold',
+          priority: 100,
+          discountType: 'fixed_cents',
+          discountValue: 1_500,
+        });
+      await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeB.id,
+          code: localCouponCode,
+          promotionId: promoB.body.id,
+          remainingQuantity: 100,
+        });
+    }, 30_000);
+
+    it('store_admin B redeeming a store-A coupon → coupon NOT applied (no discount, no leak)', async () => {
+      // Single SKU @ 10_000c, qty 1. With the cross-store coupon
+      // suppressed correctly, the order total stays at the subtotal.
+      const res = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          idempotencyKey: `cross-coupon-B-${U}`,
+          items: [{ skuId: storeBProductSkuId, quantity: 1 }],
+          couponCode: foreignCouponCode,
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.store_id).toBe(storeB.id);
+      // Discount must be ZERO — the foreign 4000c discount must NOT leak in.
+      expect(res.body.discount_cents).toBe(0);
+      expect(res.body.total_cents).toBe(10_000);
+      // No coupon row recorded against the order either.
+      expect(res.body.coupon_id ?? null).toBeNull();
+    });
+
+    it('store_admin B redeeming a SAME-store coupon → discount IS applied (positive control)', async () => {
+      // Same SKU + same flow, but the coupon is store B's own code.
+      // This proves the cross-store guard is precise: it only blocks
+      // foreign coupons and never starves legitimate same-store ones.
+      const res = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          idempotencyKey: `cross-coupon-B-local-${U}`,
+          items: [{ skuId: storeBProductSkuId, quantity: 1 }],
+          couponCode: localCouponCode,
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.store_id).toBe(storeB.id);
+      expect(res.body.discount_cents).toBe(1_500);
+      expect(res.body.total_cents).toBe(8_500);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // F-P2: Assessments paper GENERATE tenant isolation (write-side)
+  //
+  // F-P1 above proves the read-side scoping. F-P2 closes the matching
+  // write-side hole flagged in audit_report-1 §5.2: a store_admin must
+  // never be able to generate a paper into another store via the
+  // `?storeId=<other>` query param. The endpoint must reject the
+  // tenant-escape attempt and never persist a paper.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('F-P2: Assessments paper generate tenant isolation', () => {
+    beforeAll(async () => {
+      // Make sure each store has at least one approved question so a
+      // legitimate generate has something to pick from. Without this the
+      // positive control would 0-row even on the happy path.
+      const seed = async (label: string) => {
+        const q = await request(server)
+          .post('/questions')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            type: 'objective',
+            body: `PapGen-${label}-${U}`,
+            options: [
+              { body: 'yes', isCorrect: true },
+              { body: 'no', isCorrect: false },
+            ],
+          });
+        await request(server)
+          .post(`/questions/${q.body.id}/approve`)
+          .set('Authorization', `Bearer ${adminToken}`);
+      };
+      await seed('A');
+      await seed('B');
+    }, 30_000);
+
+    it('store_admin B cannot generate paper into store A via ?storeId=<A> → 403', async () => {
+      // The interesting cross-tenant case: store_admin B tries to write
+      // a paper into store A by overriding the storeId query param.
+      // Behavior contract: 403, no paper persisted, no leakage of A's id.
+      const res = await request(server)
+        .post(`/papers?storeId=${storeA.id}`)
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          name: `EscapePaper-${U}`,
+          generationRule: { type: 'random', count: 1 },
+        });
+      expect(res.status).toBe(403);
+
+      // Verify nothing landed on store A by listing as platform_admin.
+      // The escape paper name we used above must not appear anywhere.
+      const list = await request(server)
+        .get(`/papers?storeId=${storeA.id}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(list.status).toBe(200);
+      const names: string[] = list.body.map((p: any) => p.name);
+      expect(names).not.toContain(`EscapePaper-${U}`);
+    });
+
+    it('store_admin B can generate a paper in their OWN store (no override) → 201, store_id == B', async () => {
+      // Positive control on the same code path: omitting the override
+      // succeeds and the resulting paper lives in the JWT store.
+      const res = await request(server)
+        .post('/papers')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          name: `OwnStorePaper-${U}`,
+          generationRule: { type: 'random', count: 1 },
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.store_id).toBe(storeB.id);
+    });
+
+    it('store_admin B passing matching storeId (==B) is allowed → 201, no tenant escape', async () => {
+      // Defensive: an explicit but matching storeId should NOT be
+      // mistaken for an escape attempt — it must succeed.
+      const res = await request(server)
+        .post(`/papers?storeId=${storeB.id}`)
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          name: `MatchingStorePaper-${U}`,
+          generationRule: { type: 'random', count: 1 },
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.store_id).toBe(storeB.id);
+    });
+
+    it('platform_admin can still target an arbitrary store via ?storeId=<A> → 201', async () => {
+      // Regression guard: the tightening MUST be store_admin-only.
+      // platform_admin keeps the existing cross-store generate ability.
+      const res = await request(server)
+        .post(`/papers?storeId=${storeA.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: `PlatformAdminCross-${U}`,
+          generationRule: { type: 'random', count: 1 },
+        });
+      expect(res.status).toBe(201);
+      expect(res.body.store_id).toBe(storeA.id);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
   // Quality compute: invalid entityType must return 400, not 500
   // (regression for the fail-causer noted in the remediation pass)
   // ──────────────────────────────────────────────────────────────────────

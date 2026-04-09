@@ -1,5 +1,5 @@
 /// <reference types="jest" />
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { OrdersService } from '../src/orders/orders.service';
 import { Order, OrderStatus } from '../src/orders/entities/order.entity';
 
@@ -156,10 +156,25 @@ describe('OrdersService', () => {
       });
     });
 
-    it('returns existing order when idempotency key already exists (dedup)', async () => {
-      const existingOrder = buildOrder({ id: 'existing-order-id' });
+    it('returns existing order when scoped idempotency key already exists (dedup)', async () => {
+      // Stored idempotency row carries the orderId in response_body
+      // and is bound to the same actor + store as the new request.
+      // Lookup must walk the scoped index and resolve back to the same
+      // order without re-running the full create transaction.
+      const existingOrder = buildOrder({
+        id: 'existing-order-id',
+        store_id: 'store-1',
+        user_id: 'user-1',
+      });
 
-      idempotencyRepo.findOne.mockResolvedValue({ key: 'dup-key' });
+      idempotencyRepo.findOne.mockResolvedValue({
+        id: 'idem-row-id',
+        operation_type: 'create_order',
+        actor_id: 'user-1',
+        store_id: 'store-1',
+        key: 'dup-key',
+        response_body: { orderId: 'existing-order-id' },
+      });
       orderRepo.findOne.mockResolvedValue(existingOrder);
 
       const dto = {
@@ -171,8 +186,117 @@ describe('OrdersService', () => {
 
       expect(result.alreadyExisted).toBe(true);
       expect(result.order).toBe(existingOrder);
-      // Transaction should NOT have been invoked
+      // Critical: lookup is by orderId (from response_body), NOT by
+      // raw idempotency_key — that was the leak surface.
+      expect(orderRepo.findOne).toHaveBeenCalledWith({
+        where: { id: 'existing-order-id' },
+        relations: ['items'],
+      });
+      // Idempotency lookup is scoped by operation + actor + store + key.
+      expect(idempotencyRepo.findOne).toHaveBeenCalledWith({
+        where: {
+          operation_type: 'create_order',
+          actor_id: 'user-1',
+          store_id: 'store-1',
+          key: 'dup-key',
+        },
+      });
+      // Transaction should NOT have been invoked on the dedup path.
       expect(dataSource.transaction).not.toHaveBeenCalled();
+    });
+
+    // ─────────────────────────────────────────────────────────────────
+    // audit_report-1 §5.4 — cross-tenant key collision must NOT serve
+    // a foreign actor / store the existing order. The scoped lookup
+    // is the primary guard, but we also defensively re-check the
+    // resolved order's store_id + user_id before returning.
+    // ─────────────────────────────────────────────────────────────────
+    it('does NOT return foreign-store order on scoped idempotency lookup miss', async () => {
+      // The scoped lookup with (actor=user-1, store=store-1) returns
+      // null — there is no row for THIS scope. The legacy unscoped
+      // path would have matched a row in store-2 here, leaking it.
+      idempotencyRepo.findOne.mockResolvedValue(null);
+
+      const skuA = { id: 'sku-a', price_cents: 500, member_price_cents: null };
+      const qb = {
+        whereInIds: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([skuA]),
+      };
+      skuRepo.createQueryBuilder.mockReturnValue(qb);
+      manager.findOne.mockResolvedValue(buildOrder({ id: 'fresh-order-id' }));
+
+      const dto = {
+        idempotencyKey: 'reused-key',
+        items: [{ skuId: 'sku-a', quantity: 1 }],
+      };
+
+      const result = await service.createOrder(dto, storeAdminUser);
+
+      // A brand-new order is created, and the foreign tenant's row is
+      // never even fetched.
+      expect(result.alreadyExisted).toBe(false);
+      expect(orderRepo.findOne).not.toHaveBeenCalled();
+      expect(dataSource.transaction).toHaveBeenCalled();
+    });
+
+    it('refuses to return order whose store_id mismatches caller scope (defense-in-depth)', async () => {
+      // Forced edge case: somehow a row with our scope key resolves to
+      // an order whose store_id is NOT ours (e.g. legacy un-backfilled
+      // row, or migration anomaly). The service must refuse the leak.
+      idempotencyRepo.findOne.mockResolvedValue({
+        id: 'idem-row-id',
+        operation_type: 'create_order',
+        actor_id: 'user-1',
+        store_id: 'store-1',
+        key: 'leaky-key',
+        response_body: { orderId: 'foreign-order-id' },
+      });
+      orderRepo.findOne.mockResolvedValue(
+        buildOrder({
+          id: 'foreign-order-id',
+          store_id: 'store-FOREIGN',
+          user_id: 'user-1',
+        }),
+      );
+
+      await expect(
+        service.createOrder(
+          {
+            idempotencyKey: 'leaky-key',
+            items: [{ skuId: 'sku-a', quantity: 1 }],
+          },
+          storeAdminUser,
+        ),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('refuses to return order whose user_id mismatches caller (defense-in-depth)', async () => {
+      // Same store, but a different actor's row. The service must refuse.
+      idempotencyRepo.findOne.mockResolvedValue({
+        id: 'idem-row-id',
+        operation_type: 'create_order',
+        actor_id: 'user-1',
+        store_id: 'store-1',
+        key: 'shared-key',
+        response_body: { orderId: 'other-user-order-id' },
+      });
+      orderRepo.findOne.mockResolvedValue(
+        buildOrder({
+          id: 'other-user-order-id',
+          store_id: 'store-1',
+          user_id: 'user-OTHER',
+        }),
+      );
+
+      await expect(
+        service.createOrder(
+          {
+            idempotencyKey: 'shared-key',
+            items: [{ skuId: 'sku-a', quantity: 1 }],
+          },
+          storeAdminUser,
+        ),
+      ).rejects.toThrow(NotFoundException);
     });
 
     it('applies resolved promotion and coupon discount to totals', async () => {

@@ -399,6 +399,94 @@ describe('PromotionsService', () => {
   });
 
   /* -------------------------------------------------------------- */
+  /*  Cross-store coupon binding (audit_report-1 §5.3)                */
+  /*                                                                  */
+  /*  resolvePromotions must reject coupons whose store_id does not   */
+  /*  match the order's store. Mismatch is a deterministic no-op:     */
+  /*  the coupon is silently ignored, no discount is applied, and no  */
+  /*  exception is thrown — the order can still be created without    */
+  /*  the bad coupon.                                                  */
+  /* -------------------------------------------------------------- */
+  describe('cross-store coupon binding', () => {
+    it('rejects coupon whose store_id ≠ order store (no discount applied)', async () => {
+      const { service, promotionRepo, couponRepo } = createService();
+
+      // Coupon is bound to store-FOREIGN; order is for store-MINE.
+      const foreignCoupon = makeCoupon({
+        id: 'coupon-foreign',
+        store_id: 'store-FOREIGN',
+        code: 'CROSS-STORE',
+        promotion: makePromotion({
+          id: 'promo-foreign',
+          discount_type: DiscountType.FIXED_CENTS,
+          discount_value: 999,
+        }),
+        status: CouponStatus.ACTIVE,
+      });
+
+      // No auto promotions in store-MINE so the entire discount must
+      // come from the coupon — if the cross-store guard fails, this
+      // assertion below will catch it.
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([]),
+      };
+      promotionRepo.createQueryBuilder.mockReturnValue(qb);
+      couponRepo.findOne.mockResolvedValue(foreignCoupon);
+
+      const result = await service.resolvePromotions(
+        10_000,
+        'user-1',
+        'store-MINE',
+        'CROSS-STORE',
+      );
+
+      // Critical contract:
+      // - selectedCoupon stays null (not the foreign one)
+      // - totalDiscount stays 0 (the foreign 999 must NOT leak in)
+      // - selectedPromotion stays null because there are no auto promos
+      expect(result.selectedCoupon).toBeNull();
+      expect(result.selectedPromotion).toBeNull();
+      expect(result.totalDiscount).toBe(0);
+    });
+
+    it('matching coupon (same store) is still applied (positive control)', async () => {
+      const { service, promotionRepo, couponRepo } = createService();
+
+      const localCoupon = makeCoupon({
+        id: 'coupon-local',
+        store_id: 'store-MINE',
+        code: 'LOCAL10',
+        promotion: makePromotion({
+          id: 'promo-local',
+          discount_type: DiscountType.FIXED_CENTS,
+          discount_value: 250,
+        }),
+        status: CouponStatus.ACTIVE,
+      });
+
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([]),
+      };
+      promotionRepo.createQueryBuilder.mockReturnValue(qb);
+      couponRepo.findOne.mockResolvedValue(localCoupon);
+
+      const result = await service.resolvePromotions(
+        10_000,
+        'user-1',
+        'store-MINE',
+        'LOCAL10',
+      );
+
+      expect(result.selectedCoupon).toBe(localCoupon);
+      expect(result.totalDiscount).toBe(250);
+    });
+  });
+
+  /* -------------------------------------------------------------- */
   /*  14-15. First-order detection                                    */
   /* -------------------------------------------------------------- */
   describe('first-order detection', () => {

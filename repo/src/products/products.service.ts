@@ -106,10 +106,29 @@ export class ProductsService {
     await this.productRepo.remove(product);
   }
 
+  /**
+   * Submit a product for reviewer approval.
+   *
+   * audit_report-1 §5.5 — the previous flow allowed `content_reviewer`
+   * and `platform_admin` to flip a product straight to PUBLISHED via
+   * this endpoint, bypassing the explicit "review decision" step the
+   * prompt's governance model calls for. The fix routes EVERY publish
+   * request through the same `pending_review` gate; final publication
+   * is now only possible via `approveProduct`, which is auditable as a
+   * distinct reviewer action.
+   *
+   * Backward compatibility: HTTP path stays the same. The only
+   * behavioural change is that platform_admin / content_reviewer no
+   * longer skip the review state — they must call /approve afterwards.
+   */
   async publishProduct(id: string, user: any): Promise<Product> {
     const product = await this.productRepo.findOne({ where: { id } });
     if (!product) throw new NotFoundException(`Product ${id} not found`);
 
+    // store_admin can only submit a product in their own store. Other
+    // roles bypass the store check (the controller already restricts
+    // who can call this endpoint), but every role lands on the same
+    // pending_review state — no direct-publish bypass.
     if (user.role === 'store_admin') {
       const storeId = this.getUserStoreId(user);
       if (!storeId) {
@@ -118,16 +137,57 @@ export class ProductsService {
       if (product.store_id !== storeId) {
         throw new ForbiddenException('Access denied to this product');
       }
-      product.status = ProductStatus.PENDING_REVIEW;
     } else if (
-      user.role === 'content_reviewer' ||
-      user.role === 'platform_admin'
+      user.role !== 'content_reviewer' &&
+      user.role !== 'platform_admin'
     ) {
-      product.status = ProductStatus.PUBLISHED;
-    } else {
       throw new ForbiddenException('Insufficient permissions');
     }
 
+    // Idempotent transition from anything-but-published into
+    // pending_review. Re-submitting a product that's already in
+    // pending_review is a no-op (preserves auditable timestamps).
+    if (
+      product.status !== ProductStatus.PENDING_REVIEW &&
+      product.status !== ProductStatus.PUBLISHED
+    ) {
+      product.status = ProductStatus.PENDING_REVIEW;
+    } else if (product.status === ProductStatus.PUBLISHED) {
+      // Re-submitting a published product knocks it back into review —
+      // approves it again to actually re-publish.
+      product.status = ProductStatus.PENDING_REVIEW;
+    }
+
+    return this.productRepo.save(product);
+  }
+
+  /**
+   * Reviewer-approval transition: pending_review → published.
+   *
+   * Only `content_reviewer` and `platform_admin` can perform this
+   * action. The product MUST be in `pending_review` — direct draft →
+   * published is no longer possible (closes audit_report-1 §5.5).
+   */
+  async approveProduct(id: string, user: any): Promise<Product> {
+    if (
+      user.role !== 'content_reviewer' &&
+      user.role !== 'platform_admin'
+    ) {
+      throw new ForbiddenException(
+        'Only content_reviewer or platform_admin can approve products',
+      );
+    }
+
+    const product = await this.productRepo.findOne({ where: { id } });
+    if (!product) throw new NotFoundException(`Product ${id} not found`);
+
+    if (product.status !== ProductStatus.PENDING_REVIEW) {
+      throw new ConflictException(
+        `Cannot approve product in status '${product.status}'. Must be 'pending_review'.`,
+      );
+    }
+
+    product.status = ProductStatus.PUBLISHED;
     return this.productRepo.save(product);
   }
 

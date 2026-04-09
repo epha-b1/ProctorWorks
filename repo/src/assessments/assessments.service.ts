@@ -70,11 +70,46 @@ export class AssessmentsService {
     }
   }
 
+  /**
+   * Resolves the effective target store for a generate-paper call.
+   *
+   * - store_admin: ALWAYS uses the JWT's assigned store. Any caller-supplied
+   *   `?storeId=` is silently ignored — trusting it would re-introduce the
+   *   cross-store paper-write tenant escape this method is hardened against.
+   * - platform_admin / content_reviewer: may optionally target a specific
+   *   store via the query param; falsy means "no scope filter".
+   * - Other roles fall through to the same null-scope behavior, but the
+   *   controller's @Roles decorator already restricts who can call this.
+   */
+  private resolveTargetStoreForGenerate(
+    user: any,
+    requestedStoreId?: string,
+  ): string | null {
+    if (user?.role === 'store_admin') {
+      const jwtStoreId = user?.storeId ?? user?.store_id ?? null;
+      if (!jwtStoreId) {
+        throw new ForbiddenException('Store admin has no assigned store');
+      }
+      // Defensive: if a store_admin tries to target another store via the
+      // query param, that's a tenant-escape attempt — refuse it loudly so
+      // the audit trail captures it instead of silently succeeding.
+      if (requestedStoreId && requestedStoreId !== jwtStoreId) {
+        throw new ForbiddenException(
+          'store_admin cannot generate papers for another store',
+        );
+      }
+      return jwtStoreId;
+    }
+    return requestedStoreId ?? null;
+  }
+
   async generatePaper(
     dto: GeneratePaperDto,
-    userId: string,
-    storeId?: string,
+    user: any,
+    requestedStoreId?: string,
   ): Promise<Paper> {
+    const storeId = this.resolveTargetStoreForGenerate(user, requestedStoreId);
+    const userId: string = user?.id;
     const { generationRule } = dto;
     let questions: Question[];
 

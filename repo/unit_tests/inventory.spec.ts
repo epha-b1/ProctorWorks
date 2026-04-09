@@ -2,8 +2,6 @@
 import { beforeEach, describe, expect, it, jest } from '@jest/globals';
 import { ForbiddenException, NotFoundException } from '@nestjs/common';
 import { InventoryService } from '../src/inventory/inventory.service';
-import { InventoryLot } from '../src/inventory/entities/inventory-lot.entity';
-import { InventoryAdjustment } from '../src/inventory/entities/inventory-adjustment.entity';
 
 function makeRepo() {
   return {
@@ -260,12 +258,12 @@ describe('InventoryService', () => {
         // Lot lock / scope check builder. Each call gets its own fresh lot
         // snapshot — concurrent callers shouldn't share mutable state.
         return {
-          setLock: jest.fn().mockReturnThis(),
-          innerJoin: jest.fn().mockReturnThis(),
-          where: jest.fn().mockReturnThis(),
-          andWhere: jest.fn().mockReturnThis(),
-          getOne: jest.fn().mockResolvedValue({ ...lot }),
-          getCount: jest.fn().mockResolvedValue(1),
+          setLock: (jest.fn() as any).mockReturnThis(),
+          innerJoin: (jest.fn() as any).mockReturnThis(),
+          where: (jest.fn() as any).mockReturnThis(),
+          andWhere: (jest.fn() as any).mockReturnThis(),
+          getOne: (jest.fn() as any).mockResolvedValue({ ...lot }),
+          getCount: (jest.fn() as any).mockResolvedValue(1),
         };
       });
 

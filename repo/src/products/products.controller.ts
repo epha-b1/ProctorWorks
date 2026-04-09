@@ -131,9 +131,15 @@ export class ProductsController {
 
   @Post('products/:id/publish')
   @Roles('store_admin', 'content_reviewer', 'platform_admin')
-  @ApiOperation({ summary: 'Publish or submit product for review' })
+  @ApiOperation({
+    summary: 'Submit product for reviewer approval (pending_review)',
+  })
   @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
-  @ApiResponse({ status: 200, description: 'Product status updated' })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Product moved to pending_review. Use POST /products/:id/approve to publish.',
+  })
   publishProduct(
     @Param('id', ParseUUIDPipe) id: string,
     @CurrentUser() user: any,
@@ -143,6 +149,41 @@ export class ProductsController {
       await this.auditService.log(
         user.id,
         'publish_product',
+        'product',
+        id,
+        undefined,
+        traceId,
+      );
+      return product;
+    });
+  }
+
+  @Post('products/:id/approve')
+  @Roles('content_reviewer', 'platform_admin')
+  @ApiOperation({
+    summary: 'Approve a pending_review product (final publish)',
+  })
+  @ApiParam({ name: 'id', type: 'string', format: 'uuid' })
+  @ApiResponse({
+    status: 200,
+    description: 'Product approved and published',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Product is not in pending_review',
+  })
+  approveProduct(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+    @TraceId() traceId?: string,
+  ) {
+    return this.productsService.approveProduct(id, user).then(async (product) => {
+      // Distinct audit action so the reviewer's explicit decision is
+      // traceable in the audit log, separate from the original
+      // submitter's `publish_product` request.
+      await this.auditService.log(
+        user.id,
+        'approve_product',
         'product',
         id,
         undefined,

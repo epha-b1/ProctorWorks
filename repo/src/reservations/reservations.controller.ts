@@ -47,14 +47,12 @@ export class ReservationsController {
   @ApiOperation({ summary: 'List reservations with optional filters' })
   @ApiQuery({ name: 'seatId', required: false, type: 'string' })
   @ApiResponse({ status: 200, description: 'List of reservations' })
-  findAll(
-    @CurrentUser() user: any,
-    @Query('seatId') seatId?: string,
-  ) {
-    // Non-admin users can only see their own reservations
-    const isAdmin = user.role === 'platform_admin' || user.role === 'store_admin';
-    const userId = isAdmin ? undefined : user.id;
-    return this.reservationsService.findAll({ seatId, userId });
+  findAll(@Query('seatId') seatId?: string) {
+    // Endpoint is admin-only (see @Roles above), so there is no
+    // non-admin self-filter branch here. The previous "if not admin
+    // then filter by user.id" code was dead under the current role
+    // policy and was removed per audit_report-1 §5.7.
+    return this.reservationsService.findAll({ seatId });
   }
 
   @Post(':id/confirm')

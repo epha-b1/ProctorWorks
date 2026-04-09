@@ -304,16 +304,31 @@ describe('Products, Categories, Brands & SKUs API', () => {
   });
 
   // -----------------------------------------------------------------------
-  // 11. POST /products/:id/publish → 200, status changes to published
-  //     (platform_admin publishes directly)
+  // 11. POST /products/:id/publish → 200, status moves to PENDING_REVIEW.
+  //     audit_report-1 §5.5 — direct platform_admin → published bypass is
+  //     closed. Every publish request now goes through pending_review
+  //     and must be explicitly approved by a reviewer.
   // -----------------------------------------------------------------------
   describe('POST /products/:id/publish', () => {
-    it('should return 200 and set status to published for platform_admin', async () => {
+    it('should return 200 and set status to pending_review for platform_admin (no bypass)', async () => {
       logStep('POST', `/products/${productId}/publish`);
       const res = await request(server)
         .post(`/products/${productId}/publish`)
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('POST', `/products/${productId}/publish`, res.status);
+
+      expect([200, 201]).toContain(res.status);
+      expect(res.body).toHaveProperty('id', productId);
+      // Critical: even platform_admin lands on pending_review here.
+      expect(res.body).toHaveProperty('status', 'pending_review');
+    });
+
+    it('POST /products/:id/approve → 200, status published (explicit reviewer approval)', async () => {
+      logStep('POST', `/products/${productId}/approve`);
+      const res = await request(server)
+        .post(`/products/${productId}/approve`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      logStep('POST', `/products/${productId}/approve`, res.status);
 
       expect([200, 201]).toContain(res.status);
       expect(res.body).toHaveProperty('id', productId);

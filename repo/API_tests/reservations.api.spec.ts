@@ -301,6 +301,13 @@ describe('Reservations API', () => {
 
   // -----------------------------------------------------------------------
   // 7. GET /reservations -> 200, returns list
+  //
+  // The role policy is admin-only, so only admin tokens reach the
+  // service handler. The previously-dead "non-admin self-filter"
+  // controller branch was removed in audit_report-1 §5.7. The two
+  // tests below pin both halves of the contract:
+  //   (a) admin sees the global list
+  //   (b) any non-admin role hits the role guard with 403
   // -----------------------------------------------------------------------
   describe('GET /reservations - list all', () => {
     it('should return 200 with an array of reservations', async () => {
@@ -313,6 +320,35 @@ describe('Reservations API', () => {
       expect([200, 201]).toContain(res.status);
       expect(Array.isArray(res.body)).toBe(true);
       expect(res.body.length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('should return 403 for non-admin roles (role gate, not silent self-filter)', async () => {
+      // Regression guard for the dead-branch removal: a non-admin
+      // role must NEVER receive a filtered list. Anything other than
+      // 403 here would indicate the dead branch was reintroduced.
+      const u = `resroleneg_${UNIQUE}_${Math.random().toString(36).slice(2, 8)}`;
+      const created = await request(server)
+        .post('/users')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          username: u,
+          password: 'Admin1234!',
+          role: 'auditor',
+        });
+      // Some test environments may already have the user; the login
+      // is what we actually care about.
+      expect([201, 409]).toContain(created.status);
+
+      const loginRes = await request(server)
+        .post('/auth/login')
+        .send({ username: u, password: 'Admin1234!' });
+      expect(loginRes.status).toBe(200);
+      const auditorToken = loginRes.body.accessToken;
+
+      const res = await request(server)
+        .get('/reservations')
+        .set('Authorization', `Bearer ${auditorToken}`);
+      expect(res.status).toBe(403);
     });
   });
 

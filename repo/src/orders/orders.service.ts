@@ -51,16 +51,58 @@ export class OrdersService {
     dto: CreateOrderDto,
     user: any,
   ): Promise<{ order: Order; alreadyExisted: boolean }> {
-    // 1. Idempotency check
+    // 1. Idempotency check — SCOPED by operation + actor + store.
+    //
+    //    audit_report-1 §5.4 — looking up purely by `key` was a
+    //    cross-tenant leak: a caller in store B reusing a key already
+    //    issued in store A would get back the prior store-A response.
+    //    The new lookup binds the key to (operation_type, actor_id,
+    //    store_id), which is also the shape of the composite UNIQUE
+    //    index installed by the ScopeIdempotencyKeys1711900000003
+    //    migration. The same key can now legitimately exist for
+    //    different actors / stores.
+    //
+    //    We pre-resolve the caller's effective store here so the
+    //    lookup is consistent with the order we'd persist below if
+    //    the key were new — if the key DOES exist, we additionally
+    //    re-verify the persisted order's `store_id` against this
+    //    same scope before returning, as a defense-in-depth check
+    //    against any row that pre-dates the migration backfill.
+    const callerStoreId =
+      this.enforceStoreScope(user) || this.getUserStoreId(user);
+
     const existingKey = await this.idempotencyRepo.findOne({
-      where: { key: dto.idempotencyKey },
+      where: {
+        operation_type: 'create_order',
+        actor_id: user.id,
+        store_id: callerStoreId,
+        key: dto.idempotencyKey,
+      },
     });
     if (existingKey) {
-      const existingOrder = await this.orderRepo.findOne({
-        where: { idempotency_key: dto.idempotencyKey },
-        relations: ['items'],
-      });
-      return { order: existingOrder, alreadyExisted: true };
+      const orderId: string | undefined = existingKey.response_body?.orderId;
+      if (orderId) {
+        const existingOrder = await this.orderRepo.findOne({
+          where: { id: orderId },
+          relations: ['items'],
+        });
+        // Defense-in-depth: even if the index isn't trusted (e.g. a
+        // legacy unscoped row was matched somehow), refuse to return
+        // an order that doesn't belong to this caller's store.
+        if (
+          existingOrder &&
+          (callerStoreId == null || existingOrder.store_id === callerStoreId) &&
+          existingOrder.user_id === user.id
+        ) {
+          return { order: existingOrder, alreadyExisted: true };
+        }
+      }
+      // Stored key with mismatched scope — refuse to leak. Treating
+      // this as NotFound is the safest choice: the caller can retry
+      // with a fresh key, and no foreign data is exposed.
+      throw new NotFoundException(
+        'Idempotency key exists but does not belong to this scope',
+      );
     }
 
     // 2. Look up SKU prices, compute subtotal
@@ -94,8 +136,10 @@ export class OrdersService {
       });
     }
 
-    // 3. Resolve promotions/coupons (max one auto + one coupon)
-    const storeId = this.enforceStoreScope(user) || this.getUserStoreId(user);
+    // 3. Resolve promotions/coupons (max one auto + one coupon).
+    //    `callerStoreId` was resolved above for the idempotency lookup;
+    //    reuse it here so both paths see the exact same scope.
+    const storeId = callerStoreId;
     let discountCents = 0;
     let promotionId: string | null = null;
     let couponId: string | null = null;
@@ -144,10 +188,15 @@ export class OrdersService {
       );
       await manager.save(items);
 
-      // 5. Store idempotency record
+      // 5. Store idempotency record — scoped by operation + actor + store
+      //    so different tenants can legitimately reuse the same key
+      //    without colliding on the lookup, and so the read-back path
+      //    can never serve a foreign tenant's order.
       const idempotencyRecord = manager.create(IdempotencyKey, {
         key: dto.idempotencyKey,
         operation_type: 'create_order',
+        actor_id: user.id,
+        store_id: callerStoreId,
         response_body: { orderId: savedOrder.id },
       });
       await manager.save(idempotencyRecord);

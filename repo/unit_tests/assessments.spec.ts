@@ -107,7 +107,10 @@ describe('AssessmentsService', () => {
         generationRule: { type: 'random' as const, count: 2 },
       };
 
-      const result = await service.generatePaper(dto, 'user-1');
+      const result = await service.generatePaper(dto, {
+        id: 'user-1',
+        role: 'platform_admin',
+      });
 
       // Query builder was called with APPROVED status filter
       expect(qb.where).toHaveBeenCalledWith('q.status = :status', {
@@ -158,7 +161,11 @@ describe('AssessmentsService', () => {
         },
       };
 
-      const result = await service.generatePaper(dto, 'user-1', 'store-1');
+      const result = await service.generatePaper(
+        dto,
+        { id: 'user-1', role: 'platform_admin' },
+        'store-1',
+      );
 
       expect(qb.where).toHaveBeenCalledWith('q.status = :status', {
         status: QuestionStatus.APPROVED,
@@ -178,6 +185,146 @@ describe('AssessmentsService', () => {
       expect(qb.orderBy).not.toHaveBeenCalled();
 
       expect(result.paper_questions).toHaveLength(1);
+    });
+
+    // -----------------------------------------------------------------
+    // Tenant-isolation: store_admin must NEVER be able to target another
+    // store via the `?storeId=` query param. The service forces the JWT
+    // store and rejects an explicit cross-store override.
+    // -----------------------------------------------------------------
+    it('store_admin: forces JWT store and ignores caller-supplied storeId override', async () => {
+      const { service, questionRepo, paperRepo, paperQuestionRepo } =
+        buildService();
+      const qb = stubQueryBuilder(questionRepo, []);
+      paperRepo.save.mockImplementation((entity: any) =>
+        Promise.resolve({ id: 'paper-x', ...entity }),
+      );
+      paperQuestionRepo.save.mockImplementation((entities: any) =>
+        Promise.resolve(entities),
+      );
+
+      // Caller is store_admin assigned to "store-MINE" but tries to pass
+      // "store-OTHER" via the query param. Anything other than 403 here
+      // would be a tenant-write escape — the contract is to refuse.
+      await expect(
+        service.generatePaper(
+          {
+            name: 'tenant-escape',
+            generationRule: { type: 'random' as const, count: 1 },
+          },
+          {
+            id: 'user-store-admin',
+            role: 'store_admin',
+            storeId: 'store-MINE',
+          },
+          'store-OTHER',
+        ),
+      ).rejects.toThrow(ForbiddenException);
+
+      // No paper, no question fetch, no paper-questions: nothing must be
+      // persisted on the rejected path.
+      expect(paperRepo.save).not.toHaveBeenCalled();
+      expect(paperQuestionRepo.save).not.toHaveBeenCalled();
+      expect(qb.getMany).not.toHaveBeenCalled();
+    });
+
+    it('store_admin: with no override scopes the paper to the JWT store', async () => {
+      const { service, questionRepo, paperRepo, paperQuestionRepo } =
+        buildService();
+      const qb = stubQueryBuilder(questionRepo, [
+        { id: 'q1', status: QuestionStatus.APPROVED },
+      ]);
+      paperRepo.save.mockImplementation((entity: any) =>
+        Promise.resolve({ id: 'paper-store', ...entity }),
+      );
+      paperQuestionRepo.save.mockImplementation((entities: any) =>
+        Promise.resolve(entities),
+      );
+
+      const result = await service.generatePaper(
+        {
+          name: 'mine',
+          generationRule: { type: 'random' as const, count: 1 },
+        },
+        {
+          id: 'user-store-admin',
+          role: 'store_admin',
+          storeId: 'store-MINE',
+        },
+      );
+
+      // Question fetch must be store-scoped to JWT store, NOT some other.
+      expect(qb.andWhere).toHaveBeenCalledWith(
+        '(q.store_id = :storeId OR q.store_id IS NULL)',
+        { storeId: 'store-MINE' },
+      );
+      // Paper persisted with the same JWT-derived store id.
+      expect(paperRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          store_id: 'store-MINE',
+          created_by: 'user-store-admin',
+        }),
+      );
+      expect(result).toBeDefined();
+    });
+
+    it('store_admin: matching storeId override is allowed (no tenant escape)', async () => {
+      const { service, questionRepo, paperRepo, paperQuestionRepo } =
+        buildService();
+      stubQueryBuilder(questionRepo, []);
+      paperRepo.save.mockImplementation((entity: any) =>
+        Promise.resolve({ id: 'paper-match', ...entity }),
+      );
+      paperQuestionRepo.save.mockImplementation((entities: any) =>
+        Promise.resolve(entities),
+      );
+
+      await expect(
+        service.generatePaper(
+          {
+            name: 'matching-override',
+            generationRule: { type: 'random' as const, count: 1 },
+          },
+          {
+            id: 'user-store-admin',
+            role: 'store_admin',
+            storeId: 'store-MINE',
+          },
+          'store-MINE',
+        ),
+      ).resolves.toBeDefined();
+
+      expect(paperRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({ store_id: 'store-MINE' }),
+      );
+    });
+
+    it('platform_admin: cross-store storeId override is allowed (admin behavior preserved)', async () => {
+      const { service, questionRepo, paperRepo, paperQuestionRepo } =
+        buildService();
+      stubQueryBuilder(questionRepo, []);
+      paperRepo.save.mockImplementation((entity: any) =>
+        Promise.resolve({ id: 'paper-platform', ...entity }),
+      );
+      paperQuestionRepo.save.mockImplementation((entities: any) =>
+        Promise.resolve(entities),
+      );
+
+      await service.generatePaper(
+        {
+          name: 'cross-store',
+          generationRule: { type: 'random' as const, count: 1 },
+        },
+        { id: 'user-pa', role: 'platform_admin' },
+        'store-TARGET',
+      );
+
+      expect(paperRepo.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          store_id: 'store-TARGET',
+          created_by: 'user-pa',
+        }),
+      );
     });
   });
 

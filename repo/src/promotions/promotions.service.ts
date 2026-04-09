@@ -372,7 +372,15 @@ export class PromotionsService {
 
     const bestAutoPromo = filteredPromotions.length > 0 ? filteredPromotions[0] : null;
 
-    // 2. If couponCode provided, validate coupon and get linked promotion
+    // 2. If couponCode provided, validate coupon and get linked promotion.
+    //
+    //    Tenant binding (audit_report-1 §5.3): the coupon's `store_id`
+    //    MUST equal the order's `storeId` before we apply it. Without
+    //    this check, an attacker could redeem a coupon from a different
+    //    store against an order in the current store — cross-store
+    //    discount abuse and a tenant-isolation break. Mismatch is treated
+    //    as "no coupon" (deterministic, silent: no information is
+    //    leaked about whether the code exists somewhere else).
     let selectedCoupon: Coupon | null = null;
     let couponPromotion: Promotion | null = null;
 
@@ -382,14 +390,24 @@ export class PromotionsService {
         relations: ['promotion'],
       });
 
+      const storeMatches = !!coupon && coupon.store_id === storeId;
+
       if (
         coupon &&
+        storeMatches &&
         coupon.status === CouponStatus.ACTIVE &&
         (!coupon.starts_at || coupon.starts_at <= now) &&
         (!coupon.ends_at || coupon.ends_at >= now)
       ) {
         selectedCoupon = coupon;
         couponPromotion = coupon.promotion;
+      } else if (coupon && !storeMatches) {
+        // Surface the cross-store rejection in operational logs so it's
+        // visible without throwing — order creation continues without the
+        // coupon being applied.
+        this.logger.warn(
+          `Coupon ${coupon.id} (store=${coupon.store_id}) rejected for order in store ${storeId} — cross-store coupon application blocked.`,
+        );
       }
     }
 

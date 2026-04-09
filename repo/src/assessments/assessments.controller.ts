@@ -47,10 +47,14 @@ export class AssessmentsController {
   @ApiResponse({ status: 201, description: 'Paper generated' })
   generatePaper(
     @Body() dto: GeneratePaperDto,
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: any,
     @Query('storeId') storeId?: string,
   ) {
-    return this.assessmentsService.generatePaper(dto, userId, storeId);
+    // Pass the full user context so the service can force the store scope
+    // for store_admin from JWT (ignoring any caller-supplied `?storeId=`)
+    // while still letting platform_admin / content_reviewer optionally
+    // target a specific store via the query param.
+    return this.assessmentsService.generatePaper(dto, user, storeId);
   }
 
   @Get('papers/:id')

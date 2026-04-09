@@ -91,6 +91,27 @@ paths:
         "401":
           description: Invalid credentials
 
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout — invalidates the current JWT
+      description: |
+        Marks the current session row inactive so the bearer JWT
+        (identified by its `jti` claim) can no longer be used to
+        authenticate further requests. Idempotent: re-issuing logout
+        with an already-invalidated token is allowed.
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: Logged out (no content)
+        "401":
+          description: Missing or already-invalidated token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /auth/me:
     get:
       tags: [Auth]
@@ -204,6 +225,142 @@ paths:
       responses:
         "204":
           description: Deleted
+
+  /stores:
+    get:
+      tags: [Stores]
+      summary: List all stores (Platform Admin only)
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Store list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    id:
+                      type: string
+                      format: uuid
+                    name:
+                      type: string
+                    created_at:
+                      type: string
+                      format: date-time
+        "403":
+          description: Caller is not platform_admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      tags: [Stores]
+      summary: Create a store (Platform Admin only)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  example: Downtown Branch
+      responses:
+        "201":
+          description: Store created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  name:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+        "403":
+          description: Caller is not platform_admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /stores/{id}:
+    patch:
+      tags: [Stores]
+      summary: Update a store (Platform Admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+      responses:
+        "200":
+          description: Store updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  name:
+                    type: string
+        "403":
+          description: Caller is not platform_admin
+        "404":
+          description: Store not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      tags: [Stores]
+      summary: Delete a store (Platform Admin only)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Store deleted (no content)
+        "403":
+          description: Caller is not platform_admin
+        "404":
+          description: Store not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /rooms:
     get:
@@ -498,7 +655,11 @@ paths:
   /products/{id}/publish:
     post:
       tags: [Products]
-      summary: Submit for review / publish (Content Reviewer approves)
+      summary: Submit a product for reviewer approval (pending_review)
+      description: |
+        Moves the product into `pending_review`. Final publication
+        requires an explicit reviewer decision via
+        POST /products/{id}/approve.
       parameters:
         - in: path
           name: id
@@ -508,7 +669,69 @@ paths:
             format: uuid
       responses:
         "200":
-          description: Status updated
+          description: Product status set to pending_review
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [pending_review]
+        "403":
+          description: Caller lacks permission
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Product not found
+
+  /products/{id}/approve:
+    post:
+      tags: [Products]
+      summary: Approve a pending_review product (Content Reviewer / Platform Admin)
+      description: |
+        Explicit reviewer-approval transition: pending_review → published.
+        Only `content_reviewer` and `platform_admin` may invoke this.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Product approved and published
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                    format: uuid
+                  status:
+                    type: string
+                    enum: [published]
+        "403":
+          description: Caller is not a reviewer / platform_admin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Product not found
+        "409":
+          description: Product is not in pending_review
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /inventory/lots:
     get:
