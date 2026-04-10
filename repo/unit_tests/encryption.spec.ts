@@ -1,4 +1,87 @@
 import { EncryptionService } from '../src/common/encryption.service';
+import configuration from '../src/config/configuration';
+
+// ---------------------------------------------------------------------------
+// audit_report-2 MED: ENCRYPTION_KEY fail-fast validation
+//
+// The configuration loader must:
+//   - reject missing / malformed ENCRYPTION_KEY in NON-test runtime modes
+//   - only synthesise an ephemeral fallback when NODE_ENV === 'test'
+//   - enforce strict 64-hex format (AES-256 256-bit key material)
+// ---------------------------------------------------------------------------
+describe('Config: ENCRYPTION_KEY validation', () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  function withEnv(env: Record<string, string | undefined>): void {
+    process.env = { ...ORIGINAL_ENV, ...env };
+  }
+
+  it('test-mode with no ENCRYPTION_KEY: synthesises an ephemeral 64-hex key', () => {
+    withEnv({ NODE_ENV: 'test', ENCRYPTION_KEY: undefined });
+    const cfg = configuration();
+    expect(cfg.encryption.key).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('test-mode with a valid ENCRYPTION_KEY: uses the provided value (lowercased)', () => {
+    const provided =
+      'AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899';
+    withEnv({ NODE_ENV: 'test', ENCRYPTION_KEY: provided });
+    const cfg = configuration();
+    expect(cfg.encryption.key).toBe(provided.toLowerCase());
+  });
+
+  it('test-mode with a malformed ENCRYPTION_KEY: fails fast', () => {
+    withEnv({ NODE_ENV: 'test', ENCRYPTION_KEY: 'not-hex' });
+    expect(() => configuration()).toThrow(/64 hex characters/i);
+  });
+
+  it('test-mode with a short ENCRYPTION_KEY: fails fast', () => {
+    withEnv({ NODE_ENV: 'test', ENCRYPTION_KEY: 'abcd1234' });
+    expect(() => configuration()).toThrow(/64 hex characters/i);
+  });
+
+  it('production mode with NO ENCRYPTION_KEY: fails fast at config load', () => {
+    withEnv({
+      NODE_ENV: 'production',
+      ENCRYPTION_KEY: undefined,
+      JWT_SECRET: 'x'.repeat(40), // keep JWT happy so we isolate the ENCRYPTION_KEY failure
+    });
+    expect(() => configuration()).toThrow(/ENCRYPTION_KEY.*required/i);
+  });
+
+  it('production mode with malformed ENCRYPTION_KEY: fails fast at config load', () => {
+    withEnv({
+      NODE_ENV: 'production',
+      ENCRYPTION_KEY: 'bogus-value',
+      JWT_SECRET: 'x'.repeat(40),
+    });
+    expect(() => configuration()).toThrow(/64 hex characters/i);
+  });
+
+  it('development mode with NO ENCRYPTION_KEY: fails fast (no static fallback)', () => {
+    // Regression guard for the exact defect the audit flagged: if you
+    // forget to set ENCRYPTION_KEY in dev, you do NOT silently get a
+    // known static key — you get an error.
+    withEnv({ NODE_ENV: 'development', ENCRYPTION_KEY: undefined });
+    expect(() => configuration()).toThrow(/ENCRYPTION_KEY.*required/i);
+  });
+
+  it('production mode with valid ENCRYPTION_KEY: loads successfully', () => {
+    withEnv({
+      NODE_ENV: 'production',
+      ENCRYPTION_KEY:
+        '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff',
+      JWT_SECRET: 'x'.repeat(40),
+    });
+    const cfg = configuration();
+    expect(cfg.encryption.key).toHaveLength(64);
+    expect(cfg.encryption.key).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
 
 describe('EncryptionService', () => {
   let service: EncryptionService;

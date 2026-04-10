@@ -794,9 +794,14 @@ paths:
                   type: string
       responses:
         "201":
-          description: Adjustment recorded
-        "409":
-          description: Duplicate idempotency key
+          description: New adjustment recorded (first-time write)
+        "200":
+          description: >-
+            Idempotent replay — the same idempotency key was already processed
+            successfully; returns the previously stored adjustment result
+            without applying the delta again.
+        "400":
+          description: Validation error (missing/invalid fields)
 
   /orders:
     get:
@@ -972,6 +977,9 @@ paths:
     post:
       tags: [Promotions]
       summary: Claim coupon
+      description: |
+        Allowed roles: store_admin, platform_admin, content_reviewer.
+        Auditor is denied with 403 (read-only role cannot mutate coupon state).
       parameters:
         - in: path
           name: code
@@ -979,10 +987,18 @@ paths:
           schema:
             type: string
       responses:
-        "200":
-          description: Claimed
-        "409":
-          description: Coupon exhausted or expired
+        "201":
+          description: Coupon claimed (CouponClaim row created)
+        "400":
+          description: >-
+            Coupon is exhausted, expired, not yet active, or has no
+            remaining quantity.
+        "403":
+          description: >-
+            Caller role is not permitted to mutate coupon state
+            (e.g. auditor).
+        "404":
+          description: Coupon code not found
 
   /questions:
     get:
@@ -1119,6 +1135,10 @@ paths:
       description: |
         Allowed roles: platform_admin, store_admin, content_reviewer.
         auditor is denied with 403 (read-only role).
+        Object-level / tenant authorization is enforced: a store_admin whose
+        JWT store does not match the paper's `store_id` receives 404 (not
+        403, per the tenant-isolation hiding policy). No attempt row is
+        created on the denied path.
       requestBody:
         required: true
         content:
@@ -1134,7 +1154,9 @@ paths:
         "201":
           description: Attempt started
         "403":
-          description: Role not permitted
+          description: Role not permitted (or store_admin with no assigned store)
+        "404":
+          description: Paper not found or not in caller scope (store_admin hiding policy)
 
   /attempts/{id}/submit:
     post:
@@ -1180,10 +1202,18 @@ paths:
   /attempts/{id}/redo:
     post:
       tags: [Assessments]
-      summary: Redo attempt (new attempt from same paper, preserves prior)
+      summary: Redo attempt (regenerates questions from original rule)
       description: |
+        Creates a new attempt whose questions are **regenerated** from the
+        original paper's `generation_rule`. A fresh random question pull (or
+        re-evaluated rule-based filter) is executed so the new attempt sees
+        new content, not a duplicate pointer to the same paper. A new paper
+        instance is materialised under the original store scope, and the new
+        attempt carries `parent_attempt_id` back to the source. The original
+        attempt and paper are preserved.
         Allowed roles: platform_admin, store_admin, content_reviewer.
         auditor is denied with 403 (read-only role).
+        store_admin accessing a paper in another store receives 404.
       parameters:
         - in: path
           name: id
@@ -1193,9 +1223,16 @@ paths:
             format: uuid
       responses:
         "201":
-          description: New attempt created
+          description: >-
+            New attempt created, backed by a freshly regenerated paper.
+            Response includes `paper_id` (the NEW paper), `parent_attempt_id`
+            (the original attempt), and `status: in_progress`.
         "403":
           description: Role not permitted
+        "404":
+          description: >-
+            Attempt or source paper not found, or not in caller scope
+            (store_admin cross-store hiding policy)
 
   /attempts/history:
     get:
@@ -1255,9 +1292,17 @@ paths:
           required: true
           schema:
             type: string
+            enum: [products, orders, questions, users, inventory]
       responses:
-        "200":
-          description: Score computed
+        "201":
+          description: >-
+            Score computed and persisted. Returns
+            { id, entity_type, score (0-100), computed_at }.
+        "400":
+          description: >-
+            Unknown or malformed entityType. The error message lists
+            the allowed values (products, orders, questions, users,
+            inventory).
 
   /notifications:
     get:

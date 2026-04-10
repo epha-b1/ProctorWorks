@@ -116,13 +116,47 @@ describe('Assessments API', () => {
     expect(res.status).toBeGreaterThanOrEqual(400);
   });
 
-  it('POST /attempts/:id/redo → 201', async () => {
+  it('POST /attempts/:id/redo → 201 with regenerated paper (new paper_id, chain preserved)', async () => {
     logStep('POST', `/attempts/${attemptId}/redo`);
     const res = await request(server).post(`/attempts/${attemptId}/redo`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'redo', res.status);
     expect(res.status).toBe(201);
+    // Parent linkage must be intact.
     expect(res.body.parent_attempt_id).toBe(attemptId);
     expect(res.body.status).toBe('in_progress');
+
+    // audit_report-2 HIGH-2 regeneration contract: the new attempt must
+    // point at a BRAND-NEW paper (regenerated from the original rule),
+    // not the original paper id. This is the load-bearing assertion the
+    // pre-fix behaviour failed — the fix creates a fresh paper row per
+    // redo so analytics/audit can compare across regenerated content.
+    expect(res.body.paper_id).toBeDefined();
+    expect(res.body.paper_id).not.toBe(paperId);
+
+    // The original attempt must still exist and still reference the
+    // original paper — redo preserves history rather than mutating it.
+    const orig = await request(server)
+      .get(`/attempts/history`)
+      .set('Authorization', `Bearer ${token}`);
+    const origRow = orig.body.find((a: any) => a.id === attemptId);
+    expect(origRow).toBeDefined();
+    expect(origRow.paper_id).toBe(paperId);
+
+    // The regenerated paper itself must be fetchable and carry the
+    // same generation_rule shape as the source paper (not the source
+    // paper id).
+    const regenPaperRes = await request(server)
+      .get(`/papers/${res.body.paper_id}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(regenPaperRes.status).toBe(200);
+    expect(regenPaperRes.body.id).toBe(res.body.paper_id);
+    expect(regenPaperRes.body.id).not.toBe(paperId);
+    expect(regenPaperRes.body.generation_rule).toBeDefined();
+    expect(regenPaperRes.body.generation_rule.type).toBe('random');
+    // The regenerated paper must have its own paper_questions set.
+    expect(Array.isArray(regenPaperRes.body.paper_questions)).toBe(true);
+    expect(regenPaperRes.body.paper_questions.length).toBeGreaterThan(0);
+
     redoId = res.body.id;
   });
 

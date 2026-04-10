@@ -103,17 +103,19 @@ export class AssessmentsService {
     return requestedStoreId ?? null;
   }
 
-  async generatePaper(
-    dto: GeneratePaperDto,
-    user: any,
-    requestedStoreId?: string,
-  ): Promise<Paper> {
-    const storeId = this.resolveTargetStoreForGenerate(user, requestedStoreId);
-    const userId: string = user?.id;
-    const { generationRule } = dto;
-    let questions: Question[];
-
-    if (generationRule.type === 'random') {
+  /**
+   * Selects a fresh set of approved questions for a given generation rule
+   * and store scope. Shared between the initial `generatePaper` path and
+   * `redoAttempt` (which must re-run the original rule to produce a new
+   * question set per audit_report-2 HIGH-2 — redo regeneration).
+   *
+   * Passing `storeId=null` means "no scope filter" (platform_admin path).
+   */
+  private async selectQuestionsForRule(
+    generationRule: any,
+    storeId: string | null,
+  ): Promise<Question[]> {
+    if (generationRule?.type === 'random') {
       const count = generationRule.count ?? 10;
       const qb = this.questionRepo
         .createQueryBuilder('q')
@@ -125,45 +127,55 @@ export class AssessmentsService {
         });
       }
 
-      questions = await qb
-        .orderBy('RANDOM()')
-        .limit(count)
-        .getMany();
-    } else {
-      // rule-based
-      const qb = this.questionRepo
-        .createQueryBuilder('q')
-        .where('q.status = :status', { status: QuestionStatus.APPROVED });
-
-      if (storeId) {
-        qb.andWhere('(q.store_id = :storeId OR q.store_id IS NULL)', {
-          storeId,
-        });
-      }
-
-      const filters = generationRule.filters ?? {};
-      if (filters.type) {
-        qb.andWhere('q.type = :type', { type: filters.type });
-      }
-
-      const count = generationRule.count;
-      if (count) {
-        qb.limit(count);
-      }
-
-      questions = await qb.getMany();
+      return qb.orderBy('RANDOM()').limit(count).getMany();
     }
 
+    // rule-based
+    const qb = this.questionRepo
+      .createQueryBuilder('q')
+      .where('q.status = :status', { status: QuestionStatus.APPROVED });
+
+    if (storeId) {
+      qb.andWhere('(q.store_id = :storeId OR q.store_id IS NULL)', {
+        storeId,
+      });
+    }
+
+    const filters = generationRule?.filters ?? {};
+    if (filters.type) {
+      qb.andWhere('q.type = :type', { type: filters.type });
+    }
+
+    const count = generationRule?.count;
+    if (count) {
+      qb.limit(count);
+    }
+
+    return qb.getMany();
+  }
+
+  /**
+   * Persists a new Paper row and its PaperQuestion rows for a freshly
+   * selected question set. Factored out so `generatePaper` and the redo
+   * regeneration path both materialise papers the same way.
+   */
+  private async persistPaperWithQuestions(params: {
+    name: string;
+    generationRule: any;
+    createdBy: string;
+    storeId: string | null;
+    questions: Question[];
+  }): Promise<Paper> {
     const paper = this.paperRepo.create({
-      name: dto.name,
-      generation_rule: generationRule as any,
-      created_by: userId,
-      store_id: storeId ?? null,
+      name: params.name,
+      generation_rule: params.generationRule as any,
+      created_by: params.createdBy,
+      store_id: params.storeId ?? null,
     });
 
     const savedPaper = await this.paperRepo.save(paper);
 
-    const paperQuestions = questions.map((q, index) =>
+    const paperQuestions = params.questions.map((q, index) =>
       this.paperQuestionRepo.create({
         paper_id: savedPaper.id,
         question_id: q.id,
@@ -177,11 +189,53 @@ export class AssessmentsService {
     return savedPaper;
   }
 
-  async startAttempt(paperId: string, userId: string): Promise<Attempt> {
+  async generatePaper(
+    dto: GeneratePaperDto,
+    user: any,
+    requestedStoreId?: string,
+  ): Promise<Paper> {
+    const storeId = this.resolveTargetStoreForGenerate(user, requestedStoreId);
+    const userId: string = user?.id;
+    const { generationRule } = dto;
+
+    const questions = await this.selectQuestionsForRule(
+      generationRule,
+      storeId,
+    );
+
+    return this.persistPaperWithQuestions({
+      name: dto.name,
+      generationRule,
+      createdBy: userId,
+      storeId,
+      questions,
+    });
+  }
+
+  /**
+   * Start a new attempt on a paper.
+   *
+   * Object-level + tenant authorization (audit_report-2 HIGH-1):
+   *   - store_admin with no assigned store → 403 (resolveStoreScope)
+   *   - store_admin targeting a paper in another store → 404 (hiding policy,
+   *     same semantics as paper reads via enforcePaperOwnership)
+   *   - allowed roles (platform_admin / store_admin / content_reviewer) pass
+   *     through
+   *
+   * Critically, the ownership check runs BEFORE attemptRepo.create so no
+   * attempt row is ever persisted on the denied path.
+   */
+  async startAttempt(paperId: string, user: any): Promise<Attempt> {
+    const userId: string = user?.id;
     const paper = await this.paperRepo.findOne({ where: { id: paperId } });
     if (!paper) {
       throw new NotFoundException('Paper not found');
     }
+
+    // Reuse the same ownership guard as paper reads so 404 is returned for
+    // out-of-scope store_admin access (never 403), matching the tenant
+    // isolation hiding policy used elsewhere in the module.
+    this.enforcePaperOwnership(paper, user);
 
     const attempt = this.attemptRepo.create({
       paper_id: paperId,
@@ -279,7 +333,35 @@ export class AssessmentsService {
     return this.attemptRepo.save(attempt);
   }
 
-  async redoAttempt(attemptId: string, userId: string): Promise<Attempt> {
+  /**
+   * Redo an attempt — create a new attempt that RE-GENERATES its question
+   * set from the ORIGINAL paper's generation rule, instead of reusing the
+   * same fixed paper instance.
+   *
+   * audit_report-2 HIGH-2: the prior behaviour only copied `paper_id` to
+   * the new attempt, so every redo walked the exact same question set
+   * (violating the prompt semantics for redo regeneration and breaking
+   * analytics/audit comparisons across attempts).
+   *
+   * New behaviour:
+   *   1. Load the original attempt and its source paper.
+   *   2. Enforce the same store-scope/hiding policy as paper reads so a
+   *      store_admin cannot trigger a regeneration on an out-of-scope
+   *      paper (404, never 403 — hiding policy).
+   *   3. Re-run `selectQuestionsForRule` with the original paper's
+   *      generation_rule + its store scope to pull a FRESH question set.
+   *   4. Materialise a new Paper row (derived from the original rule,
+   *      same store scope) so the model's fixed paper→question linkage
+   *      is preserved without mutating the original paper.
+   *   5. Create the redo Attempt pointing at the NEW paper and carrying
+   *      `parent_attempt_id = original.id` so the chain stays intact.
+   *   6. Leave the original attempt and its paper untouched.
+   */
+  async redoAttempt(
+    attemptId: string,
+    user: any,
+  ): Promise<Attempt> {
+    const userId: string = user?.id;
     const original = await this.attemptRepo.findOne({
       where: { id: attemptId },
     });
@@ -292,8 +374,43 @@ export class AssessmentsService {
       throw new BadRequestException('Attempt does not belong to this user');
     }
 
+    // Load the source paper so we have its generation_rule + store scope.
+    const sourcePaper = await this.paperRepo.findOne({
+      where: { id: original.paper_id },
+    });
+    if (!sourcePaper) {
+      // Original paper disappeared — treat same as missing attempt rather
+      // than silently dropping regeneration on the floor.
+      throw new NotFoundException('Source paper for attempt not found');
+    }
+
+    // Hiding policy: out-of-scope store_admin can't regenerate from a
+    // foreign paper any more than they can read it.
+    this.enforcePaperOwnership(sourcePaper, user);
+
+    // Re-run the ORIGINAL generation rule, scoped to the same store as the
+    // original paper. This is the "regenerate" contract — a new random
+    // pull (or re-evaluated filter set) so the new attempt sees fresh
+    // content, not a duplicate pointer.
+    const generationRule = (sourcePaper.generation_rule as any) ?? {};
+    const questions = await this.selectQuestionsForRule(
+      generationRule,
+      sourcePaper.store_id ?? null,
+    );
+
+    // Materialise a brand-new paper instance derived from the original
+    // rule, same store scope. The name is suffixed so operators can tell
+    // redo-derived papers apart from the originals in audit listings.
+    const regeneratedPaper = await this.persistPaperWithQuestions({
+      name: `${sourcePaper.name} (redo)`,
+      generationRule,
+      createdBy: userId,
+      storeId: sourcePaper.store_id ?? null,
+      questions,
+    });
+
     const newAttempt = this.attemptRepo.create({
-      paper_id: original.paper_id,
+      paper_id: regeneratedPaper.id,
       user_id: userId,
       parent_attempt_id: attemptId,
       status: AttemptStatus.IN_PROGRESS,

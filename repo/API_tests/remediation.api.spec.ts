@@ -508,6 +508,95 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
+  // HIGH-1 (audit_report-2): POST /attempts cross-store denial
+  //
+  // A store_admin must NOT be able to start an attempt on a paper that
+  // lives in another store. The service returns 404 (hiding policy, not
+  // 403) and must NOT persist an attempt row on the denied path.
+  //
+  // This covers the "Missing security coverage" gap called out in
+  // the coverage mapping table §8.2 of the audit report.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('HIGH-1: POST /attempts cross-store attempt start denial', () => {
+    let paperInStoreA: string;
+
+    beforeAll(async () => {
+      // Seed one approved question + paper scoped to store A using
+      // platform_admin (trusted cross-store write path).
+      const q = await request(server)
+        .post('/questions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          type: 'objective',
+          body: `CrossAttemptQ-${U}`,
+          options: [
+            { body: 'yes', isCorrect: true },
+            { body: 'no', isCorrect: false },
+          ],
+        });
+      await request(server)
+        .post(`/questions/${q.body.id}/approve`)
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      const p = await request(server)
+        .post(`/papers?storeId=${storeA.id}`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: `CrossAttemptPaper-${U}`,
+          generationRule: { type: 'random', count: 1 },
+        });
+      expect(p.status).toBe(201);
+      expect(p.body.store_id).toBe(storeA.id);
+      paperInStoreA = p.body.id;
+    }, 30_000);
+
+    it('store_admin B cannot start attempt on store A paper → 404', async () => {
+      const res = await request(server)
+        .post('/attempts')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({ paperId: paperInStoreA });
+
+      // Hiding policy: 404, never 403, no leakage of store_id.
+      expect(res.status).toBe(404);
+      expect(res.body).not.toHaveProperty('store_id');
+    });
+
+    it('store_admin A CAN start attempt on store A paper → 201', async () => {
+      const res = await request(server)
+        .post('/attempts')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({ paperId: paperInStoreA });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('in_progress');
+      expect(res.body.paper_id).toBe(paperInStoreA);
+    });
+
+    it('platform_admin CAN start attempt on store A paper → 201 (unchanged)', async () => {
+      const res = await request(server)
+        .post('/attempts')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ paperId: paperInStoreA });
+
+      expect(res.status).toBe(201);
+      expect(res.body.status).toBe('in_progress');
+    });
+
+    it('no attempt row was created for the denied cross-store call', async () => {
+      // Fetch history as store_admin B — their attempt list must NOT
+      // contain any attempt pointing at paperInStoreA.
+      const hist = await request(server)
+        .get('/attempts/history')
+        .set('Authorization', `Bearer ${storeAdminBToken}`);
+      expect(hist.status).toBe(200);
+      const storeAPaperAttempts = hist.body.filter(
+        (a: any) => a.paper_id === paperInStoreA,
+      );
+      expect(storeAPaperAttempts).toHaveLength(0);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
   // F-P5: Publish flow requires explicit reviewer approval
   //
   // audit_report-1 §5.5 — content_reviewer / platform_admin used to be

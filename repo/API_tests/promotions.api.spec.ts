@@ -143,4 +143,197 @@ describe('Promotions & Coupons API', () => {
     expect(res.status).toBe(201);
     expect(res.body.priority).toBe(900);
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Coverage gap C: Distribute / Redeem edge behaviour
+  //
+  // audit_report-2 §8.2 — the coverage table flags weak API-level tests
+  // for distribute-insufficient-quantity and cap-reached-redeem. These
+  // tests close that gap with end-to-end assertions.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('Distribute / Redeem edge cases', () => {
+    let edgePromoId: string;
+    let edgeCouponId: string;
+    const edgeCouponCode = `EDGE-${U}`;
+
+    beforeAll(async () => {
+      // Promotion with a redemption_cap = 1 (for cap-reached test).
+      const promo = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          name: `EdgePromo-${U}`,
+          type: 'percentage',
+          priority: 50,
+          discountType: 'percentage',
+          discountValue: 10,
+          redemptionCap: 1,
+        });
+      expect(promo.status).toBe(201);
+      edgePromoId = promo.body.id;
+
+      // Coupon with remaining_quantity = 2 (for distribute-insufficient test).
+      const coupon = await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          code: edgeCouponCode,
+          promotionId: edgePromoId,
+          remainingQuantity: 2,
+        });
+      expect(coupon.status).toBe(201);
+      edgeCouponId = coupon.body.id;
+    }, 30_000);
+
+    // Helper: provision N real users via /users so distribute() gets
+    // valid UUIDv4 ids that pass the @IsUUID('4', { each: true }) DTO
+    // guard. Real users also keep coupon_claims FK semantics happy.
+    const provisionUsers = async (count: number): Promise<string[]> => {
+      const ids: string[] = [];
+      for (let i = 0; i < count; i++) {
+        const r = await request(server)
+          .post('/users')
+          .set('Authorization', `Bearer ${token}`)
+          .send({
+            username: `edgedist${U}-${i}-${Math.random().toString(36).slice(2, 8)}`,
+            password: 'Admin1234!',
+            role: 'content_reviewer',
+          });
+        expect(r.status).toBe(201);
+        ids.push(r.body.id);
+      }
+      return ids;
+    };
+
+    it('Distribute to more users than remaining quantity → 400', async () => {
+      // Coupon has 2 remaining but we try to distribute to 5 users.
+      const recipients = await provisionUsers(5);
+      const res = await request(server)
+        .post(`/coupons/${edgeCouponId}/distribute`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userIds: recipients });
+
+      expect(res.status).toBe(400);
+      expect(res.body.message).toMatch(/remaining/i);
+    });
+
+    it('Distribute within capacity → 201 and remaining is decremented', async () => {
+      // Coupon has 2 remaining — distributing to 2 should succeed.
+      const recipients = await provisionUsers(2);
+      const res = await request(server)
+        .post(`/coupons/${edgeCouponId}/distribute`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userIds: recipients });
+
+      expect(res.status).toBe(201);
+      expect(Array.isArray(res.body)).toBe(true);
+      expect(res.body).toHaveLength(2);
+
+      // Verify the coupon is now exhausted (remaining should be 0).
+      const list = await request(server)
+        .get('/coupons')
+        .set('Authorization', `Bearer ${token}`);
+      const coupon = list.body.find((c: any) => c.id === edgeCouponId);
+      expect(coupon.remaining_quantity).toBe(0);
+      expect(coupon.status).toBe('exhausted');
+    });
+
+    it('Distribute on exhausted coupon → 400', async () => {
+      const recipients = await provisionUsers(1);
+      const res = await request(server)
+        .post(`/coupons/${edgeCouponId}/distribute`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userIds: recipients });
+
+      expect(res.status).toBe(400);
+    });
+
+    it('Redeem after cap reached → 400', async () => {
+      // First, create a fresh coupon + claim so the redeem path can fire.
+      const capCode = `CAP-${U}`;
+      const capCoupon = await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          code: capCode,
+          promotionId: edgePromoId,
+          remainingQuantity: 10,
+        });
+      expect(capCoupon.status).toBe(201);
+
+      // Claim it for user who will attempt redeem.
+      const claimRes = await request(server)
+        .post(`/coupons/${capCode}/claim`)
+        .set('Authorization', `Bearer ${token}`);
+      expect([200, 201]).toContain(claimRes.status);
+
+      // Redeem #1 — should succeed (cap=1, count starts at 0).
+      // Need a valid orderId — create a fake one via the orders API.
+      // We need at least one SKU. Let me seed one.
+      const cat = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: `CapCat-${U}` });
+      const brand = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ name: `CapBrand-${U}` });
+      const prod = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          name: `CapProd-${U}`,
+          categoryId: cat.body.id,
+          brandId: brand.body.id,
+        });
+      const sku = await request(server)
+        .post(`/products/${prod.body.id}/skus`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ skuCode: `CAP-SKU-${U}`, priceCents: 5000 });
+      const order = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          idempotencyKey: `cap-order-${U}`,
+          items: [{ skuId: sku.body.id, quantity: 1 }],
+        });
+      expect(order.status).toBe(201);
+
+      // Use the admin user id from the login JWT (from /auth/me).
+      const me = await request(server)
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${token}`);
+      const adminUserId = me.body.id;
+
+      // First redeem — cap=1, should work.
+      const redeem1 = await request(server)
+        .post(`/coupons/${capCode}/redeem`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userId: adminUserId, orderId: order.body.id });
+      expect([200, 201]).toContain(redeem1.status);
+
+      // Second: claim again and try to redeem.
+      const claimRes2 = await request(server)
+        .post(`/coupons/${capCode}/claim`)
+        .set('Authorization', `Bearer ${token}`);
+      expect([200, 201]).toContain(claimRes2.status);
+
+      const order2 = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          idempotencyKey: `cap-order2-${U}`,
+          items: [{ skuId: sku.body.id, quantity: 1 }],
+        });
+      expect(order2.status).toBe(201);
+
+      // Second redeem — cap is REACHED (count=1 == cap=1). Must fail.
+      const redeem2 = await request(server)
+        .post(`/coupons/${capCode}/redeem`)
+        .set('Authorization', `Bearer ${token}`)
+        .send({ userId: adminUserId, orderId: order2.body.id });
+      expect(redeem2.status).toBe(400);
+      expect(redeem2.body.message).toMatch(/cap/i);
+    });
+  });
 });

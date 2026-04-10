@@ -99,17 +99,26 @@ export class AssessmentsController {
   @Roles('platform_admin', 'store_admin', 'content_reviewer')
   @ApiOperation({ summary: 'Start an attempt' })
   @ApiResponse({ status: 201, description: 'Attempt started' })
+  @ApiResponse({
+    status: 404,
+    description: 'Paper not found or not in caller scope',
+  })
   async startAttempt(
     @Body() dto: StartAttemptDto,
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: any,
     @TraceId() traceId?: string,
   ) {
+    // audit_report-2 HIGH-1: pass the FULL user context (not just id) so the
+    // service can enforce the same store-scope/hiding policy as paper reads.
+    // A store_admin cannot start an attempt on a paper that lives in another
+    // store — the service returns 404 (never 403) to avoid leaking the
+    // paper's existence across tenants, and no attempt row is created.
     const attempt = await this.assessmentsService.startAttempt(
       dto.paperId,
-      userId,
+      user,
     );
     await this.auditService.log(
-      userId,
+      user.id,
       'start_attempt',
       'attempt',
       attempt.id,
@@ -147,20 +156,39 @@ export class AssessmentsController {
 
   @Post('attempts/:id/redo')
   @Roles('platform_admin', 'store_admin', 'content_reviewer')
-  @ApiOperation({ summary: 'Redo an attempt' })
-  @ApiResponse({ status: 201, description: 'New attempt created for redo' })
+  @ApiOperation({
+    summary: 'Redo an attempt (regenerates content from original rule)',
+    description:
+      'Creates a new attempt whose questions are regenerated from the ' +
+      'original paper\'s generation rule (a fresh question set, not a ' +
+      'duplicate pointer). A new paper instance is materialised under the ' +
+      'original store scope and the new attempt carries parent_attempt_id ' +
+      'back to the source. The original attempt and paper are preserved.',
+  })
+  @ApiResponse({
+    status: 201,
+    description:
+      'New attempt created for redo, backed by a freshly regenerated paper',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Attempt or source paper not found / not in caller scope',
+  })
   async redoAttempt(
     @Param('id', ParseUUIDPipe) id: string,
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: any,
     @TraceId() traceId?: string,
   ) {
-    const attempt = await this.assessmentsService.redoAttempt(id, userId);
+    const attempt = await this.assessmentsService.redoAttempt(id, user);
     await this.auditService.log(
-      userId,
+      user.id,
       'redo_attempt',
       'attempt',
       id,
-      { newAttemptId: (attempt as any)?.id },
+      {
+        newAttemptId: (attempt as any)?.id,
+        regeneratedPaperId: (attempt as any)?.paper_id,
+      },
       traceId,
     );
     return attempt;

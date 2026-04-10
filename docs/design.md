@@ -191,7 +191,19 @@ orders
   store_id uuid FK stores
   user_id uuid FK users
   status enum DEFAULT pending          -- pending | confirmed | fulfilled | cancelled
-  idempotency_key text UNIQUE NOT NULL
+  idempotency_key text NOT NULL        -- NOT globally unique; deduplication is
+                                       --   enforced by idempotency_keys below,
+                                       --   scoped per (operation_type, actor,
+                                       --   store). See migration
+                                       --   1711900000004-DropOrdersIdempotency
+                                       --   KeyUnique — the legacy global
+                                       --   UNIQUE constraint was removed so
+                                       --   two tenants can legitimately reuse
+                                       --   the same opaque key without
+                                       --   23505 unique-violation crashes.
+                                       --   A plain BTREE index
+                                       --   IDX_orders_idempotency_key backs
+                                       --   the lookup path.
   total_cents int NOT NULL
   discount_cents int DEFAULT 0
   coupon_id uuid FK coupons (nullable)
@@ -341,11 +353,51 @@ audit_logs
   -- NO UPDATE, NO DELETE for app DB role
 
 idempotency_keys
-  key text PK
-  operation_type text NOT NULL
+  id uuid PK                           -- surrogate key; see migration
+                                       --   1711900000003-ScopeIdempotencyKeys
+  key text NOT NULL                    -- caller-supplied opaque key;
+                                       --   NOT globally unique on its own
+  operation_type text NOT NULL         -- e.g. 'create_order',
+                                       --      'inventory_adjust'
+  actor_id uuid NOT NULL               -- user whose JWT scoped the write
+  store_id uuid NULL                   -- store scope (nullable for
+                                       --   cross-store / platform_admin ops)
   response_body jsonb NOT NULL
   created_at timestamptz NOT NULL
+  UNIQUE (operation_type, actor_id,    -- composite uniqueness: the ACTUAL
+          COALESCE(store_id,           --   deduplication contract. NULL
+                   '0..0'::uuid),      --   store_ids are collapsed onto a
+          key)                         --   sentinel UUID so they still
+                                       --   collide deterministically.
+  -- Lookup index:
+  INDEX (operation_type, actor_id, store_id)
 ```
+
+**Scoped idempotency — runtime semantics (audit_report-1 §5.4, implemented by
+migrations `1711900000003-ScopeIdempotencyKeys` and
+`1711900000004-DropOrdersIdempotencyKeyUnique`):**
+
+- The legacy schema keyed `idempotency_keys` on `key` alone, so duplicate
+  lookups were global by `key`. A caller in store B reusing a key already
+  issued in store A would collide on lookup and be served store A's prior
+  response. That is a cross-tenant data leak via predictable keys.
+- Deduplication is now scoped by the 4-tuple
+  `(operation_type, actor_id, store_id, key)`. Two callers in different
+  tenants may legitimately reuse the same opaque key — each resolves to
+  its own row and its own response body.
+- The global `UNIQUE (orders.idempotency_key)` constraint was dropped
+  because it would otherwise conflict with the scoped model (a cross-
+  tenant duplicate key would still 23505 at the orders level even though
+  the scoped lookup would have happily produced two rows). A plain
+  BTREE index (`IDX_orders_idempotency_key`) remains for lookup
+  performance only — it is not a uniqueness contract.
+- Services look up prior responses by calling the scoped repository with
+  `(operation_type, actor_id, store_id, key)` derived from the request
+  context. The same tuple is stored on successful completion so replays
+  return the cached response.
+- Operation types currently in use: `create_order` (orders),
+  `inventory_adjust` (inventory adjustment). New operations must pick a
+  stable string literal and scope against it.
 
 ---
 
@@ -369,14 +421,24 @@ UPDATE seats SET status=available WHERE id IN (expired reservations)
 
 ```
 1. POST /orders {idempotency_key, items, coupon_code?}
-2. Check idempotency_key not in idempotency_keys → else return stored response
+2. Scoped idempotency lookup by (operation_type='create_order',
+   actor_id=caller.id, store_id=caller.storeId, key=idempotency_key)
+   → if a row exists, return its stored response (replay).
+   Two callers in different stores may legitimately reuse the same key;
+   each resolves to their OWN row via the composite lookup. This closes
+   the cross-tenant leak that the legacy `key`-only lookup allowed.
 3. Calculate subtotal from items
-4. Find applicable automatic promotions (active, within time window, not capped)
-5. If coupon_code provided: validate coupon (active, not expired, not exhausted)
-6. Resolve conflicts: sort by priority desc, tie-break by best customer value
+4. Find applicable automatic promotions (active, within time window,
+   not capped, store_id matches order store)
+5. If coupon_code provided: validate coupon (active, not expired, not
+   exhausted, store_id matches order store — cross-store coupons are
+   silently dropped to avoid leaking the existence of a foreign code)
+6. Resolve conflicts: sort by priority desc, tie-break by best customer
+   value, then lower UUID
 7. Apply at most one coupon + one automatic promotion
-8. INSERT order + order_items
-9. Store idempotency_key + response
+8. INSERT order + order_items (orders.idempotency_key is NOT globally
+   unique; the scoped row in idempotency_keys is the source of truth)
+9. INSERT idempotency_keys row with the 4-tuple and the cached response
 10. Return 201
 ```
 
@@ -476,7 +538,14 @@ volumes:
 
 - Index all foreign keys
 - Index `reservations.hold_until`, `reservations.status`
-- Index `orders.idempotency_key`, `inventory_adjustments.idempotency_key`
+- Index `orders.idempotency_key` (plain BTREE, NOT unique — uniqueness is
+  enforced by the composite `idempotency_keys` unique index described in
+  §5; see migrations `1711900000003-ScopeIdempotencyKeys` and
+  `1711900000004-DropOrdersIdempotencyKeyUnique`)
+- Index `inventory_adjustments.idempotency_key`
+- Index `idempotency_keys (operation_type, actor_id, store_id)` plus the
+  composite UNIQUE on `(operation_type, actor_id,
+  COALESCE(store_id, sentinel), key)`
 - Index `coupons.code`, `promotions.priority`
 - Index `audit_logs.created_at`, `audit_logs.actor_id`
 - TypeORM query builder for complex joins (avoid N+1)
