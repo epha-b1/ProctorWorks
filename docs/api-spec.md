@@ -978,8 +978,14 @@ paths:
       tags: [Promotions]
       summary: Claim coupon
       description: |
-        Allowed roles: store_admin, platform_admin, content_reviewer.
-        Auditor is denied with 403 (read-only role cannot mutate coupon state).
+        Allowed roles: store_admin, platform_admin.
+        Both auditor and content_reviewer are denied with 403 — claim
+        is a commerce-mutation surface (decrements remaining_quantity,
+        may flip the coupon to EXHAUSTED, creates a CouponClaim row),
+        and only the two write-eligible commerce roles may invoke it.
+        store_admin callers are additionally restricted to coupons in
+        their own store via the hiding policy (foreign-store coupons
+        return 404, not 403).
       parameters:
         - in: path
           name: code
@@ -995,8 +1001,9 @@ paths:
             remaining quantity.
         "403":
           description: >-
-            Caller role is not permitted to mutate coupon state
-            (e.g. auditor).
+            Caller role is not permitted to mutate coupon state.
+            Returned for auditor and content_reviewer, and for any
+            store_admin without an assigned store.
         "404":
           description: Coupon code not found
 

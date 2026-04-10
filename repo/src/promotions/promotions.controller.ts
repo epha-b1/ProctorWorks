@@ -190,13 +190,15 @@ export class PromotionsController {
   }
 
   @Post('coupons/:code/claim')
-  @Roles('store_admin', 'platform_admin', 'content_reviewer')
+  @Roles('store_admin', 'platform_admin')
   @ApiOperation({ summary: 'Claim a coupon' })
   @ApiResponse({ status: 201, description: 'Coupon claimed' })
   @ApiResponse({
     status: 403,
     description:
-      'Caller role is not permitted to mutate coupon state (e.g. auditor)',
+      'Caller role is not permitted to mutate coupon state. Only ' +
+      'store_admin and platform_admin may claim coupons; auditor and ' +
+      'content_reviewer are denied.',
   })
   async claimCoupon(
     @Param('code') code: string,
@@ -214,6 +216,14 @@ export class PromotionsController {
     // audit_report-2 P0-2: pass the FULL user context (not just `id`)
     // so the service can enforce coupon.store_id ownership for
     // store_admin via the same hiding policy as distribute/redeem.
+    //
+    // audit_report-2 (closeout policy patch): content_reviewer is now
+    // also denied. Reviewers exist to QA question/paper content, not
+    // to mutate commerce state — letting them claim coupons would
+    // give the review role an unbounded discount surface that the
+    // business model never authorised. The decorator above is the
+    // single source of truth for the policy and is mirrored by the
+    // 4-role API regression block in remediation.api.spec.ts.
     const claim = await this.promotionsService.claimCoupon(code, user);
     await this.auditService.log(
       user.id,
@@ -235,8 +245,42 @@ export class PromotionsController {
     @Body('userId') userId: string,
     @Body('orderId') orderId: string,
     @CurrentUser() user: any,
+    @TraceId() traceId?: string,
   ) {
-    return this.promotionsService.redeemCoupon(code, userId, orderId, user);
+    // audit_report-2 (closeout pass) — redeem was the only coupon
+    // write surface that did NOT emit an audit log entry. Distribute,
+    // claim, and expire all log via the same .then() chain pattern;
+    // this brings redeem into line so the audit table records who
+    // redeemed which coupon against which order, with the same
+    // metadata shape used by the rest of the coupon write surfaces:
+    //
+    //   actor_id     = caller's user id (from JWT, never the body)
+    //   action       = 'redeem_coupon'
+    //   resource_type= 'coupon'
+    //   resource_id  = the redeemed claim's coupon_id (post-resolve)
+    //   detail       = { code, orderId, userId } — code/order/user
+    //                  context for incident replay; userId here is
+    //                  the body-supplied target (the account whose
+    //                  claim is being burned), distinct from
+    //                  actor_id which is always the caller.
+    //   trace_id     = request trace id from the interceptor
+    //
+    // The body-supplied `userId` is intentionally captured into the
+    // detail bag instead of overriding `actor_id` — that preserves
+    // the audit invariant that `actor_id` is ALWAYS the JWT subject.
+    return this.promotionsService
+      .redeemCoupon(code, userId, orderId, user)
+      .then(async (claim) => {
+        await this.auditService.log(
+          user.id,
+          'redeem_coupon',
+          'coupon',
+          (claim as any)?.coupon_id,
+          { code, orderId, userId },
+          traceId,
+        );
+        return claim;
+      });
   }
 
   @Post('coupons/:id/distribute')

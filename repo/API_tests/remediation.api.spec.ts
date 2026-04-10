@@ -1219,74 +1219,148 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // HIGH-2: auditor cannot mutate coupon state via /coupons/:code/claim
+  // HIGH-2 (closeout): /coupons/:code/claim role policy is store_admin
+  //                    + platform_admin only.
   //
-  // The previous controller wired `claimCoupon` with no @Roles decorator
-  // at all, so the RolesGuard returned `true` for any authenticated
-  // caller — including the read-only `auditor` role. Claiming is a
-  // write op (decrements `remaining_quantity`, may flip the coupon to
-  // EXHAUSTED, and creates a CouponClaim row), so it is now restricted
-  // to the same write roles as the rest of the coupon write surfaces.
+  // Original HIGH-2 (audit_report-1): the controller had NO @Roles
+  // decorator at all, so the RolesGuard returned `true` for every
+  // authenticated caller — including the read-only `auditor`. The
+  // first remediation pass tightened the decorator to
+  // {store_admin, platform_admin, content_reviewer} so auditor was
+  // explicitly denied.
+  //
+  // Closeout policy (audit_report-2): content_reviewer is ALSO denied.
+  // Reviewers exist to QA question/paper content; granting them a
+  // commerce-mutation surface gave the review role an unbounded
+  // discount path the business model never authorised. The
+  // controller decorator is now {store_admin, platform_admin} only.
+  //
+  // This block enforces the FULL 4-role matrix so any future
+  // regression that loosens the decorator (or accidentally
+  // re-introduces a denied role) trips a red API test before
+  // landing on main.
   // ──────────────────────────────────────────────────────────────────────
-  describe('HIGH-2: auditor cannot claim coupons', () => {
-    let claimCouponCode: string;
+  describe('HIGH-2 (closeout): /coupons/:code/claim 4-role matrix', () => {
+    // Each test in this block uses its OWN freshly-created coupon
+    // so the assertions are independent of order and the
+    // remaining_quantity bookkeeping is deterministic. We provision
+    // them up-front in beforeAll so the test bodies stay focused on
+    // the role-vs-status contract they're verifying.
+    let auditorCouponCode: string;
+    let reviewerCouponCode: string;
+    let storeAdminCouponCode: string;
+    let platformAdminCouponCode: string;
+    let promotionId: string;
 
     beforeAll(async () => {
-      // Create a tiny promotion + coupon as platform_admin so we have
-      // a real, ACTIVE coupon to attempt the claim against.
       const promo = await request(server)
         .post('/promotions')
         .set('Authorization', `Bearer ${adminToken}`)
         .send({
           storeId: storeA.id,
-          name: `H2Promo-${U}`,
+          name: `H2-4role-Promo-${U}`,
           type: 'percentage',
           priority: 10,
           discountType: 'percentage',
           discountValue: 10,
         });
-      claimCouponCode = `H2-${U}`;
-      await request(server)
-        .post('/coupons')
-        .set('Authorization', `Bearer ${adminToken}`)
-        .send({
-          storeId: storeA.id,
-          code: claimCouponCode,
-          promotionId: promo.body.id,
-          remainingQuantity: 5,
-        });
+      expect(promo.status).toBe(201);
+      promotionId = promo.body.id;
+
+      const provisionCoupon = async (suffix: string): Promise<string> => {
+        const code = `H2-4role-${suffix}-${U}`;
+        const r = await request(server)
+          .post('/coupons')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            storeId: storeA.id,
+            code,
+            promotionId,
+            remainingQuantity: 5,
+          });
+        expect(r.status).toBe(201);
+        return code;
+      };
+
+      auditorCouponCode = await provisionCoupon('aud');
+      reviewerCouponCode = await provisionCoupon('rev');
+      storeAdminCouponCode = await provisionCoupon('sa');
+      platformAdminCouponCode = await provisionCoupon('pa');
     }, 30_000);
 
-    it('auditor POST /coupons/:code/claim → 403 (no state mutation)', async () => {
-      const before = await request(server)
+    // Helper: read one specific coupon row by code via the
+    // platform-admin listing. The /coupons endpoint is the only
+    // way to inspect remaining_quantity + status for the
+    // defense-in-depth no-mutation assertions.
+    const fetchCoupon = async (code: string): Promise<any> => {
+      const list = await request(server)
         .get('/coupons')
         .set('Authorization', `Bearer ${adminToken}`);
-      const beforeRow = before.body.find((c: any) => c.code === claimCouponCode);
-      const beforeQty = beforeRow.remaining_quantity;
+      expect(list.status).toBe(200);
+      return list.body.find((c: any) => c.code === code);
+    };
+
+    // ─── Denied roles ───────────────────────────────────────────
+    it('auditor → 403 + no state mutation', async () => {
+      const before = await fetchCoupon(auditorCouponCode);
+      const beforeQty = before.remaining_quantity;
 
       const res = await request(server)
-        .post(`/coupons/${claimCouponCode}/claim`)
+        .post(`/coupons/${auditorCouponCode}/claim`)
         .set('Authorization', `Bearer ${auditorToken}`);
       expect(res.status).toBe(403);
 
-      // Defense-in-depth: verify the underlying state was not mutated
-      // even though the request was rejected.
-      const after = await request(server)
-        .get('/coupons')
-        .set('Authorization', `Bearer ${adminToken}`);
-      const afterRow = after.body.find((c: any) => c.code === claimCouponCode);
-      expect(afterRow.remaining_quantity).toBe(beforeQty);
-      expect(afterRow.status).toBe('active');
+      // Defense-in-depth: verify state was NOT mutated.
+      const after = await fetchCoupon(auditorCouponCode);
+      expect(after.remaining_quantity).toBe(beforeQty);
+      expect(after.status).toBe('active');
     });
 
-    it('store_admin POST /coupons/:code/claim → 200/201 (positive control)', async () => {
-      // Same endpoint, allowed role. Confirms the @Roles tightening
-      // doesn't accidentally block the legitimate write path.
+    it('content_reviewer → 403 + no state mutation', async () => {
+      const before = await fetchCoupon(reviewerCouponCode);
+      const beforeQty = before.remaining_quantity;
+
       const res = await request(server)
-        .post(`/coupons/${claimCouponCode}/claim`)
+        .post(`/coupons/${reviewerCouponCode}/claim`)
+        .set('Authorization', `Bearer ${reviewerToken}`);
+      // CLOSEOUT POLICY: content_reviewer is now an explicitly
+      // denied role for /coupons/:code/claim. This assertion is
+      // the load-bearing test for the policy decision.
+      expect(res.status).toBe(403);
+
+      // Defense-in-depth: nothing changed.
+      const after = await fetchCoupon(reviewerCouponCode);
+      expect(after.remaining_quantity).toBe(beforeQty);
+      expect(after.status).toBe('active');
+    });
+
+    // ─── Allowed roles (positive controls) ──────────────────────
+    it('store_admin → 200/201 + claim row + remaining decremented', async () => {
+      const before = await fetchCoupon(storeAdminCouponCode);
+      const beforeQty = before.remaining_quantity;
+
+      const res = await request(server)
+        .post(`/coupons/${storeAdminCouponCode}/claim`)
         .set('Authorization', `Bearer ${storeAdminAToken}`);
       expect([200, 201]).toContain(res.status);
       expect(res.body.coupon_id).toBeDefined();
+
+      const after = await fetchCoupon(storeAdminCouponCode);
+      expect(after.remaining_quantity).toBe(beforeQty - 1);
+    });
+
+    it('platform_admin → 200/201 + claim row + remaining decremented', async () => {
+      const before = await fetchCoupon(platformAdminCouponCode);
+      const beforeQty = before.remaining_quantity;
+
+      const res = await request(server)
+        .post(`/coupons/${platformAdminCouponCode}/claim`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect([200, 201]).toContain(res.status);
+      expect(res.body.coupon_id).toBeDefined();
+
+      const after = await fetchCoupon(platformAdminCouponCode);
+      expect(after.remaining_quantity).toBe(beforeQty - 1);
     });
   });
 
@@ -1449,6 +1523,128 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
       expect(log).toBeDefined();
       expect(log.actor_id).toBeDefined();
       expect(log.trace_id).toBeTruthy();
+    });
+
+    // ─────────────────────────────────────────────────────────────
+    // audit_report-2 (closeout pass) — coupon redeem audit log.
+    //
+    // Redeem was the only coupon write surface that did NOT emit
+    // an audit log entry. The other write surfaces (claim,
+    // distribute, expire) all log via the same .then() chain, and
+    // they each have a corresponding HIGH-3 / coverage test. This
+    // test brings the redeem path into line with the rest:
+    //   - the action `redeem_coupon` lands in audit_logs
+    //   - actor_id is the JWT subject (admin), NOT the body userId
+    //   - resource_id is the coupon id (resolved by the service)
+    //   - trace_id is non-empty (request trace from interceptor)
+    //   - detail.code / detail.orderId / detail.userId are recorded
+    //     so an incident replay can reconstruct what happened
+    // ─────────────────────────────────────────────────────────────
+    it('promotions: redeem_coupon → audit log written', async () => {
+      // Build a self-contained redeem chain so this test does not
+      // depend on state left by other HIGH-3 cases:
+      //   1. promo + coupon (store A, percentage, cap=null)
+      //   2. user claims the coupon
+      //   3. user creates an order (need a SKU first)
+      //   4. user redeems the coupon for that order
+      //   5. assert the audit row exists with the expected shape
+      const promo = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeA.id,
+          name: `H3RedeemPromo-${U}`,
+          type: 'percentage',
+          priority: 5,
+          discountType: 'percentage',
+          discountValue: 5,
+        });
+      expect(promo.status).toBe(201);
+
+      const couponCode = `H3-REDEEM-${U}`;
+      const coupon = await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          storeId: storeA.id,
+          code: couponCode,
+          promotionId: promo.body.id,
+          remainingQuantity: 5,
+        });
+      expect(coupon.status).toBe(201);
+
+      // Resolve the admin user id so we can redeem against ourselves.
+      const me = await request(server)
+        .get('/auth/me')
+        .set('Authorization', `Bearer ${adminToken}`);
+      const adminUserId = me.body.id;
+
+      // Claim the coupon FIRST so the redeem path has an
+      // unredeemed claim row to consume.
+      const claim = await request(server)
+        .post(`/coupons/${couponCode}/claim`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect([200, 201]).toContain(claim.status);
+
+      // Build a SKU + order so we have a real orderId to bind the
+      // redemption to. The redeem service does not validate the
+      // orderId against the orders table, but we use a real one
+      // anyway for realism (and so the audit detail has a true id).
+      const cat = await request(server)
+        .post('/categories')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `H3RedCat-${U}` });
+      const brand = await request(server)
+        .post('/brands')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ name: `H3RedBrand-${U}` });
+      const prod = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({
+          name: `H3RedProd-${U}`,
+          categoryId: cat.body.id,
+          brandId: brand.body.id,
+        });
+      const sku = await request(server)
+        .post(`/products/${prod.body.id}/skus`)
+        .set('Authorization', `Bearer ${storeAdminAToken}`)
+        .send({ skuCode: `H3-RED-${U}`, priceCents: 5_000 });
+      const order = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          idempotencyKey: `h3-redeem-order-${U}`,
+          items: [{ skuId: sku.body.id, quantity: 1 }],
+        });
+      expect(order.status).toBe(201);
+
+      // Now redeem. This is the call that must produce the new
+      // audit log entry the closeout pass added.
+      const redeem = await request(server)
+        .post(`/coupons/${couponCode}/redeem`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ userId: adminUserId, orderId: order.body.id });
+      expect([200, 201]).toContain(redeem.status);
+
+      const log = await findLog(
+        'redeem_coupon',
+        (l) =>
+          l.resource_type === 'coupon' &&
+          l.resource_id === coupon.body.id,
+      );
+      expect(log).toBeDefined();
+      // actor_id is ALWAYS the JWT subject — never the body userId.
+      // Both happen to be `adminUserId` here because admin is
+      // redeeming against itself, but the assertion is on actor_id.
+      expect(log.actor_id).toBe(adminUserId);
+      expect(log.trace_id).toBeTruthy();
+      // The detail bag must capture code/order/user context for
+      // forensic replay.
+      expect(log.detail).toBeDefined();
+      expect(log.detail.code).toBe(couponCode);
+      expect(log.detail.orderId).toBe(order.body.id);
+      expect(log.detail.userId).toBe(adminUserId);
     });
   });
 
