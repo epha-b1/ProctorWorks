@@ -438,7 +438,27 @@ export class PromotionsService {
       }
     }
 
-    // 8. Max one coupon + one automatic promotion per order
+    // 8. Max one coupon + one automatic promotion per order.
+    //
+    // audit_report-2 (test fixer pass) — bug fix:
+    //   When a coupon is bound to a Promotion record that ALSO matches
+    //   the auto-promotion query (same store, active, in window, not
+    //   capped), the same promotion id was being applied TWICE — once
+    //   on the auto path and once on the coupon path. That violated
+    //   the documented contract in `docs/design.md §6` ("Apply at most
+    //   one coupon + one automatic promotion") and double-counted the
+    //   discount, producing user-visible wrong totals.
+    //
+    //   Fix: dedupe by promotion id. If `couponPromotion.id` is the
+    //   same Promotion row as `bestAutoPromo.id`, skip the coupon-side
+    //   discount accumulation and just record the coupon binding so
+    //   the order still references the coupon (for analytics + the
+    //   one-claim-per-coupon ledger). The auto-side `selectedPromotion`
+    //   already points at the same row.
+    //
+    //   Two distinct Promotion rows on the auto and coupon path
+    //   continue to stack as before — that's the documented
+    //   "max one + max one" behaviour.
     let totalDiscount = 0;
     let selectedPromotion: Promotion | null = null;
 
@@ -451,12 +471,25 @@ export class PromotionsService {
     }
 
     if (couponPromotion) {
-      const couponDiscount = this.calculateDiscount(couponPromotion, orderTotalCents);
-      if (couponDiscount > 0) {
-        totalDiscount += couponDiscount;
-        // If no auto promo was selected, the coupon promotion becomes the selected one
-        if (!selectedPromotion) {
-          selectedPromotion = couponPromotion;
+      const sameAsAuto =
+        !!bestAutoPromo && bestAutoPromo.id === couponPromotion.id;
+      if (sameAsAuto) {
+        // Coupon is bound to the SAME promotion the auto path already
+        // applied — count its discount exactly once. We still leave
+        // `selectedCoupon` populated so the order ledger records the
+        // coupon binding (claim attribution, redemption analytics).
+      } else {
+        const couponDiscount = this.calculateDiscount(
+          couponPromotion,
+          orderTotalCents,
+        );
+        if (couponDiscount > 0) {
+          totalDiscount += couponDiscount;
+          // If no auto promo was selected, the coupon promotion
+          // becomes the selected one.
+          if (!selectedPromotion) {
+            selectedPromotion = couponPromotion;
+          }
         }
       }
     }

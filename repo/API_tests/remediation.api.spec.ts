@@ -938,9 +938,32 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
         });
     }, 30_000);
 
-    it('store_admin B redeeming a store-A coupon → coupon NOT applied (no discount, no leak)', async () => {
-      // Single SKU @ 10_000c, qty 1. With the cross-store coupon
-      // suppressed correctly, the order total stays at the subtotal.
+    it('store_admin B redeeming a store-A coupon → coupon NOT applied (no leak vs baseline)', async () => {
+      // Contract being verified:
+      //
+      //   The foreign (store-A) coupon must contribute ZERO to a
+      //   store-B order. We can't simply assert `discount_cents = 0`
+      //   because the test setup intentionally creates a same-store
+      //   AUTO promotion in store B (`CrossPromoB`, 1500c) so the
+      //   "positive control" test below has something to apply.
+      //
+      // Instead we measure the leak directly: place TWO orders for
+      // the same SKU + qty, one with NO coupon (the baseline) and
+      // one with the foreign coupon. If the cross-store guard works,
+      // both orders get exactly the same discount — the foreign
+      // 4000c never leaks in. If the guard regresses, the foreign
+      // discount lands on the second order and the two totals
+      // diverge.
+      const baseline = await request(server)
+        .post('/orders')
+        .set('Authorization', `Bearer ${storeAdminBToken}`)
+        .send({
+          idempotencyKey: `cross-coupon-B-baseline-${U}`,
+          items: [{ skuId: storeBProductSkuId, quantity: 1 }],
+        });
+      expect(baseline.status).toBe(201);
+      expect(baseline.body.store_id).toBe(storeB.id);
+
       const res = await request(server)
         .post('/orders')
         .set('Authorization', `Bearer ${storeAdminBToken}`)
@@ -951,10 +974,15 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
         });
       expect(res.status).toBe(201);
       expect(res.body.store_id).toBe(storeB.id);
-      // Discount must be ZERO — the foreign 4000c discount must NOT leak in.
-      expect(res.body.discount_cents).toBe(0);
-      expect(res.body.total_cents).toBe(10_000);
-      // No coupon row recorded against the order either.
+
+      // Critical: foreign coupon must NOT shift the totals at all.
+      // discount_cents and total_cents both equal the no-coupon
+      // baseline, proving the foreign 4000c never leaked in.
+      expect(res.body.discount_cents).toBe(baseline.body.discount_cents);
+      expect(res.body.total_cents).toBe(baseline.body.total_cents);
+
+      // No coupon row recorded against the order either — the
+      // service silently dropped it as a cross-store mismatch.
       expect(res.body.coupon_id ?? null).toBeNull();
     });
 

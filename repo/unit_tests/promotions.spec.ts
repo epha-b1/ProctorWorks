@@ -495,6 +495,63 @@ describe('PromotionsService', () => {
       expect(result.selectedCoupon).toBe(coupon);
       expect(result.selectedPromotion).not.toBeNull();
     });
+
+    // ─────────────────────────────────────────────────────────────
+    // audit_report-2 (test fixer pass) — promotion dedup bug fix.
+    //
+    // When a coupon is bound to a Promotion record that ALSO matches
+    // the auto-promotion query (same store + active + in-window +
+    // not capped), the same promotion id was being applied TWICE —
+    // once on the auto path and once on the coupon path. That
+    // violated docs/design.md §6 "Apply at most one coupon + one
+    // automatic promotion" and double-counted the discount.
+    //
+    // The fix dedupes by promotion id. This test pins the contract
+    // so any regression that re-introduces the double-count blows
+    // up here before it reaches integration.
+    // ─────────────────────────────────────────────────────────────
+    it('does NOT double-count when coupon promo == best auto promo (same id)', async () => {
+      const { service, promotionRepo, couponRepo } = createService();
+
+      // ONE Promotion row that satisfies BOTH selection paths.
+      const sharedPromo = makePromotion({
+        id: 'promo-shared',
+        priority: 10,
+        discount_type: DiscountType.FIXED_CENTS,
+        discount_value: 1500,
+      });
+
+      const couponBoundToSharedPromo = makeCoupon({
+        code: 'SHARED-CODE',
+        store_id: 'store-1',
+        promotion: sharedPromo,
+        status: CouponStatus.ACTIVE,
+      });
+
+      // Auto-promotion query returns the same promo as the coupon.
+      const qb = {
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue([sharedPromo]),
+      };
+      promotionRepo.createQueryBuilder.mockReturnValue(qb);
+      couponRepo.findOne.mockResolvedValue(couponBoundToSharedPromo);
+
+      const result = await service.resolvePromotions(
+        10000,
+        'user-1',
+        'store-1',
+        'SHARED-CODE',
+      );
+
+      // Critical contract: 1500 (one application), NOT 3000 (double).
+      expect(result.totalDiscount).toBe(1500);
+      // Coupon binding is still recorded — for analytics + the
+      // one-claim-per-coupon ledger — even though its discount was
+      // suppressed for being a duplicate of the auto path.
+      expect(result.selectedCoupon).toBe(couponBoundToSharedPromo);
+      expect(result.selectedPromotion?.id).toBe('promo-shared');
+    });
   });
 
   /* -------------------------------------------------------------- */
