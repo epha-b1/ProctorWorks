@@ -179,7 +179,38 @@ export class QuestionsService {
     return this.explanationRepo.save(explanation);
   }
 
-  async getExplanations(questionId: string): Promise<QuestionExplanation[]> {
+  /**
+   * Returns versioned explanations for a question.
+   *
+   * audit_report-2 P0-3: object-level / tenant authorization.
+   *
+   * Previously this only filtered by `question_id` and emitted whatever
+   * rows existed — no question existence check, no caller scope check.
+   * That meant a store_admin in store B could enumerate explanations
+   * for a question that lived in store A simply by knowing or guessing
+   * the question id (or by harvesting ids from a noisy log). Worse,
+   * because the listing was empty for non-existent ids and non-empty
+   * for existing-but-foreign ids, the response itself was a tenant
+   * existence oracle.
+   *
+   * Fix: load the parent question first, run it through the same
+   * `enforceQuestionOwnership` guard used by every other read/write
+   * surface, and only then return its explanations. For store_admin
+   * callers, an out-of-store question is indistinguishable from a
+   * missing question (404, never 403).
+   */
+  async getExplanations(
+    questionId: string,
+    user?: any,
+  ): Promise<QuestionExplanation[]> {
+    const question = await this.questionRepo.findOne({
+      where: { id: questionId },
+    });
+    if (!question) {
+      throw new NotFoundException('Question not found');
+    }
+    this.enforceQuestionOwnership(question, user);
+
     return this.explanationRepo.find({
       where: { question_id: questionId },
       order: { version_number: 'ASC' },

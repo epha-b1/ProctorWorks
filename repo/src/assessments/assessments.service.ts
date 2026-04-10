@@ -247,6 +247,34 @@ export class AssessmentsService {
     return this.attemptRepo.save(attempt);
   }
 
+  /**
+   * Submits answers for an in-progress attempt and grades it.
+   *
+   * audit_report-2 P0-4: submission integrity hardening.
+   *
+   * Previously:
+   *   - any questionId could be submitted, even one that wasn't part
+   *     of the attempt's paper (so a caller could grade themselves
+   *     against a question they cherry-picked)
+   *   - any optionId could be passed for a given question, including
+   *     options that belonged to a *different* question (silently
+   *     auto-graded as wrong, distorting analytics)
+   *   - the same questionId could appear multiple times in the same
+   *     submission (double-counted in score, flooded attempt_answers)
+   *
+   * New rules (all enforced BEFORE any answer row is persisted):
+   *   1) Every `answer.questionId` must be a member of the attempt's
+   *      paper, looked up via the `paper_questions` join table.
+   *   2) If `selectedOptionId` is provided, it MUST belong to the same
+   *      `question_id` — cross-question option references are rejected.
+   *   3) Duplicate `questionId` entries inside one submission body are
+   *      rejected up-front, before any DB lookup, to bound work.
+   *
+   * All three failures surface as 400 (BadRequestException) — these
+   * are caller-supplied content errors, not authentication issues, and
+   * the global exception filter wraps them in the standard envelope
+   * with traceId for client diagnostics.
+   */
   async submitAttempt(
     attemptId: string,
     answers: SubmitAnswerDto[],
@@ -268,6 +296,36 @@ export class AssessmentsService {
       throw new BadRequestException('Attempt is not in progress');
     }
 
+    // (3) Duplicate-question guard. Bail before any DB work so a
+    //     malicious client can't run up cost by spamming the same id.
+    const seen = new Set<string>();
+    for (const ans of answers) {
+      if (seen.has(ans.questionId)) {
+        throw new BadRequestException(
+          `Duplicate questionId in submission: ${ans.questionId}`,
+        );
+      }
+      seen.add(ans.questionId);
+    }
+
+    // (1) Membership guard: load the set of question ids that actually
+    //     belong to this attempt's paper. Anything outside this set is
+    //     a 400 — even if the caller's chosen question id exists in
+    //     `questions`, it's still an invalid submission for this paper.
+    const paperQuestions = await this.paperQuestionRepo.find({
+      where: { paper_id: attempt.paper_id },
+    });
+    const allowedQuestionIds = new Set(
+      paperQuestions.map((pq) => pq.question_id),
+    );
+    for (const ans of answers) {
+      if (!allowedQuestionIds.has(ans.questionId)) {
+        throw new BadRequestException(
+          `Question ${ans.questionId} is not part of this attempt's paper`,
+        );
+      }
+    }
+
     const now = new Date();
     let correctCount = 0;
     let totalObjective = 0;
@@ -279,7 +337,13 @@ export class AssessmentsService {
       });
 
       if (!question) {
-        throw new NotFoundException(`Question ${ans.questionId} not found`);
+        // Belt-and-braces: even though (1) above already restricted
+        // questionId to paper members, the question row itself could
+        // have been deleted between the membership check and the
+        // grading loop. Treat as a content error rather than a 500.
+        throw new BadRequestException(
+          `Question ${ans.questionId} not found`,
+        );
       }
 
       let isCorrect: boolean | null = null;
@@ -292,13 +356,28 @@ export class AssessmentsService {
             where: { id: ans.selectedOptionId },
           });
 
-          if (option) {
-            isCorrect = option.is_correct;
-            if (isCorrect) {
-              correctCount++;
-            }
-          } else {
-            isCorrect = false;
+          if (!option) {
+            // Selected option does not exist at all — caller-side
+            // content error.
+            throw new BadRequestException(
+              `Option ${ans.selectedOptionId} not found`,
+            );
+          }
+
+          // (2) Cross-question option guard. The option must hang off
+          //     the SAME question this answer is targeting. Without
+          //     this check, an attacker could pass a known-correct
+          //     option from a different question and silently grade
+          //     as wrong (or worse, leak option metadata).
+          if (option.question_id !== ans.questionId) {
+            throw new BadRequestException(
+              `Option ${ans.selectedOptionId} does not belong to question ${ans.questionId}`,
+            );
+          }
+
+          isCorrect = option.is_correct;
+          if (isCorrect) {
+            correctCount++;
           }
         } else {
           isCorrect = false;

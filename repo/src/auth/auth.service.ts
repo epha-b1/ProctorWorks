@@ -11,7 +11,7 @@ import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
 import * as bcrypt from 'bcrypt';
 import { randomUUID } from 'crypto';
-import { User, UserStatus } from './entities/user.entity';
+import { User, UserRole, UserStatus } from './entities/user.entity';
 import { CreateUserDto } from './dto/create-user.dto';
 import { UpdateUserDto } from './dto/update-user.dto';
 import { EncryptionService } from '../common/encryption.service';
@@ -160,6 +160,47 @@ export class AuthService {
     return this.userRepository.findOne({ where: { id: payload.sub } });
   }
 
+  /**
+   * Enforces the role/store invariant at the user-management boundary.
+   *
+   * audit_report-2 P0-5: previously a user with role=store_admin could
+   * be created or updated WITHOUT a storeId, leaving the cluster in a
+   * state where every store-scoped service had to defensively reject
+   * the unassigned admin at request time. Worse, a store_admin could
+   * be downgraded to a non-scoped role (e.g. content_reviewer) while
+   * keeping a stale `store_id`, which would mislead audit-trail
+   * lookups about who was scoped to which store.
+   *
+   * Policy chosen and applied uniformly:
+   *   - role=store_admin REQUIRES storeId. Missing storeId at create
+   *     OR update fails fast with 400.
+   *   - Any non-store_admin role MUST have store_id = null. We strip
+   *     it on the way through. This mirrors the database-level
+   *     intent (the column is nullable) and removes the stale
+   *     assignment ambiguity.
+   *
+   * Throws BadRequestException for the missing-storeId case so the
+   * caller sees a clean validation error in the standard envelope
+   * (with traceId), not an opaque 500 from a downstream guard.
+   */
+  private assertRoleStoreInvariant(
+    role: UserRole | string | undefined,
+    storeId: string | null | undefined,
+  ): string | null {
+    if (role === UserRole.STORE_ADMIN) {
+      if (!storeId) {
+        throw new BadRequestException(
+          'storeId is required for role=store_admin',
+        );
+      }
+      return storeId;
+    }
+    // Non-store_admin: never carry a store assignment, regardless of
+    // whatever the caller passed. Returning null here is the silent
+    // sanitisation step that removes the stale-assignment ambiguity.
+    return null;
+  }
+
   async createUser(dto: CreateUserDto): Promise<User> {
     const existing = await this.userRepository.findOne({
       where: { username: dto.username },
@@ -170,11 +211,18 @@ export class AuthService {
 
     const passwordHash = await bcrypt.hash(dto.password, this.bcryptRounds);
 
+    // P0-5 invariant: store_admin must have storeId; everyone else
+    // must NOT have one. Throws BadRequestException on violation.
+    const resolvedStoreId = this.assertRoleStoreInvariant(
+      dto.role,
+      dto.storeId,
+    );
+
     const user = this.userRepository.create({
       username: dto.username,
       password_hash: passwordHash,
       role: dto.role,
-      store_id: dto.storeId || null,
+      store_id: resolvedStoreId,
     });
 
     const saved = await this.userRepository.save(user);
@@ -204,6 +252,15 @@ export class AuthService {
     if (dto.notes !== undefined) {
       user.notes = dto.notes ? this.encryptionService.encrypt(dto.notes) : null;
     }
+
+    // P0-5 invariant: re-validate AFTER all field updates have been
+    // applied so we catch every transition into a bad state — e.g.
+    //  * promoting to store_admin without supplying a storeId
+    //  * downgrading away from store_admin and leaving a stale storeId
+    // The helper throws on missing-storeId for store_admin and
+    // returns null for any non-store_admin role, which we then
+    // assign back so the saved row never carries a stale store.
+    user.store_id = this.assertRoleStoreInvariant(user.role, user.store_id);
 
     const saved = await this.userRepository.save(user);
 

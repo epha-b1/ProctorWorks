@@ -225,8 +225,17 @@ export class QuestionsController {
   @Get(':id/explanations')
   @ApiOperation({ summary: 'Get explanations for a question' })
   @ApiResponse({ status: 200, description: 'List of explanations' })
-  getExplanations(@Param('id', ParseUUIDPipe) id: string, @CurrentUser() user: any) {
-    return this.questionsService.getExplanations(id);
+  @ApiResponse({
+    status: 404,
+    description: 'Question not found or not in caller scope',
+  })
+  getExplanations(
+    @Param('id', ParseUUIDPipe) id: string,
+    @CurrentUser() user: any,
+  ) {
+    // audit_report-2 P0-3: pass full user context so the service can
+    // enforce the same store-scope hiding policy as findById.
+    return this.questionsService.getExplanations(id, user);
   }
 
   @Post(':id/explanations')

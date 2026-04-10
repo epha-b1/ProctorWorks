@@ -11,7 +11,13 @@ export class SeedDemoData1711900000001 implements MigrationInterface {
       ON CONFLICT ("name") DO NOTHING
     `);
 
-    // Demo store_admin user (password: Store1234!)
+    // Demo store_admin user (password: Admin1234!)
+    //
+    // audit_report-2 P2-8: this comment previously read "Store1234!"
+    // which conflicted with README §"Default Credentials" — the
+    // README is the source of truth, every seeded demo user shares
+    // the password `Admin1234!` (the bcrypt hash below is identical
+    // to the reviewer/auditor seed rows, which proves the claim).
     await queryRunner.query(`
       INSERT INTO "users" ("id", "username", "password_hash", "role", "store_id", "status")
       VALUES (

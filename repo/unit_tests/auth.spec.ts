@@ -356,7 +356,7 @@ describe('AuthService', () => {
   // 10. createUser: hashes password, creates user
   // -----------------------------------------------------------------------
   describe('createUser', () => {
-    it('should hash the password and create a user', async () => {
+    it('should hash the password and create a store_admin user with storeId', async () => {
       userRepo.findOne.mockResolvedValue(null); // no duplicate
       userRepo.create.mockImplementation((data: any) => ({ ...data }));
       userRepo.save.mockImplementation((entity: any) =>
@@ -366,7 +366,7 @@ describe('AuthService', () => {
       const dto = {
         username: 'newuser',
         password: 'plaintext123',
-        role: UserRole.CONTENT_REVIEWER,
+        role: UserRole.STORE_ADMIN,
         storeId: 'store-1',
       };
 
@@ -386,7 +386,7 @@ describe('AuthService', () => {
       expect((result as any).password_hash).toBeUndefined();
     });
 
-    it('should default store_id to null when storeId is not provided', async () => {
+    it('should default store_id to null when storeId is not provided for non-store_admin', async () => {
       userRepo.findOne.mockResolvedValue(null);
       userRepo.create.mockImplementation((data: any) => ({ ...data }));
       userRepo.save.mockImplementation((entity: any) =>
@@ -415,11 +415,99 @@ describe('AuthService', () => {
         username: 'testuser',
         password: 'whatever',
         role: UserRole.STORE_ADMIN,
+        storeId: 'store-1',
       };
 
       await expect(service.createUser(dto as any)).rejects.toThrow(
         ConflictException,
       );
+    });
+
+    // -------------------------------------------------------------------
+    // audit_report-2 P0-5: store_admin role/store invariant
+    //
+    // Policy:
+    //   - role=store_admin REQUIRES storeId. Missing → 400.
+    //   - non-store_admin: store_id is forced to null even if the
+    //     caller passed one (silent sanitisation, no stale assignment).
+    //
+    // Both branches are validated at create AND update time so a user
+    // cannot be promoted into / out of store_admin while leaving the
+    // role/store pair in an inconsistent state.
+    // -------------------------------------------------------------------
+    describe('P0-5: role/store invariant', () => {
+      it('store_admin without storeId at create → BadRequestException, no save', async () => {
+        userRepo.findOne.mockResolvedValue(null);
+
+        const dto = {
+          username: 'badsa',
+          password: 'plaintext123',
+          role: UserRole.STORE_ADMIN,
+          // storeId omitted
+        };
+
+        await expect(service.createUser(dto as any)).rejects.toThrow(
+          BadRequestException,
+        );
+
+        // Defense in depth: nothing landed in the repo.
+        expect(userRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('non-store_admin with storeId at create → store_id forced to null', async () => {
+        userRepo.findOne.mockResolvedValue(null);
+        userRepo.create.mockImplementation((data: any) => ({ ...data }));
+        userRepo.save.mockImplementation((entity: any) =>
+          Promise.resolve({ id: 'new-uuid', ...entity }),
+        );
+
+        const dto = {
+          username: 'reviewer',
+          password: 'plaintext123',
+          role: UserRole.CONTENT_REVIEWER,
+          storeId: 'store-leaked',
+        };
+
+        await service.createUser(dto as any);
+
+        const createArg = userRepo.create.mock.calls[0][0];
+        expect(createArg.store_id).toBeNull();
+      });
+
+      it('updateUser: promote to store_admin without storeId → 400', async () => {
+        const reviewer = makeUser({
+          role: UserRole.CONTENT_REVIEWER,
+          store_id: null,
+        });
+        userRepo.findOne.mockResolvedValue(reviewer);
+
+        await expect(
+          service.updateUser('user-uuid-1', {
+            role: UserRole.STORE_ADMIN,
+          } as any),
+        ).rejects.toThrow(BadRequestException);
+
+        expect(userRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('updateUser: downgrade store_admin → non-admin clears stale store_id', async () => {
+        const sa = makeUser({
+          role: UserRole.STORE_ADMIN,
+          store_id: 'store-A',
+        });
+        userRepo.findOne.mockResolvedValue(sa);
+        userRepo.save.mockImplementation((entity: any) =>
+          Promise.resolve({ ...entity }),
+        );
+
+        await service.updateUser('user-uuid-1', {
+          role: UserRole.AUDITOR,
+        } as any);
+
+        const savedArg = userRepo.save.mock.calls[0][0];
+        expect(savedArg.role).toBe(UserRole.AUDITOR);
+        expect(savedArg.store_id).toBeNull();
+      });
     });
   });
 

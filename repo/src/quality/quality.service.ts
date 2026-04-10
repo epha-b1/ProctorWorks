@@ -334,6 +334,49 @@ export class QualityService {
     }
   }
 
+  /**
+   * Returns the timestamp columns that actually exist on a table.
+   *
+   * audit_report-2 P1-6: the previous freshness query embedded
+   * `MAX(updated_at)` literally inside a CASE WHEN EXISTS subquery.
+   * That doesn't help — Postgres parses the column reference at plan
+   * time, before any subquery runs, so it fails with "column
+   * `updated_at` does not exist" against tables like `products`,
+   * `questions`, and `inventory_lots` (which only have `created_at`).
+   *
+   * Fix: probe `information_schema.columns` ONCE per check to learn
+   * which timestamp columns the table actually has, then build the
+   * query dynamically using only the columns we know are present.
+   * Both the table name and the column names are still passed
+   * through `assertSafeIdentifier` so identifier injection is
+   * impossible even if the metadata response is corrupted somehow.
+   *
+   * Returns the column names in priority order ('updated_at' first,
+   * then 'created_at') so callers know which columns to feed into
+   * GREATEST. Empty array means the table has neither — caller
+   * should treat as "no signal" and skip the freshness check.
+   */
+  private async detectTimestampColumns(
+    safeTable: string,
+  ): Promise<string[]> {
+    const rows = await this.dataSource.query(
+      `
+      SELECT column_name
+      FROM information_schema.columns
+      WHERE table_name = $1
+        AND column_name IN ('updated_at', 'created_at')
+      `,
+      [safeTable],
+    );
+    const present = new Set<string>(
+      rows.map((r: any) => String(r.column_name)),
+    );
+    const ordered: string[] = [];
+    if (present.has('updated_at')) ordered.push('updated_at');
+    if (present.has('created_at')) ordered.push('created_at');
+    return ordered;
+  }
+
   @Cron(CronExpression.EVERY_HOUR)
   async checkFreshness(): Promise<void> {
     const thresholdHours =
@@ -343,18 +386,39 @@ export class QualityService {
       try {
         const tableName = ENTITY_TABLE_MAP[entityType];
         const safeTable = assertSafeIdentifier(tableName, 'tableName');
+
+        // Probe metadata for which timestamp columns this table
+        // actually has. Building the query off the probe result is
+        // the difference between "always works" and "blows up on any
+        // table without updated_at".
+        const tsCols = await this.detectTimestampColumns(safeTable);
+        if (tsCols.length === 0) {
+          // No timestamp columns at all — nothing meaningful to
+          // freshness-check. Skip silently rather than crash.
+          continue;
+        }
+
+        // Re-validate every column name even though they came from
+        // an information_schema lookup. Defense in depth: an
+        // identifier escape via metadata corruption would be a
+        // catastrophic SQL injection vector.
+        const safeCols = tsCols.map((c) =>
+          assertSafeIdentifier(c, 'timestamp column'),
+        );
+
+        // GREATEST over the available columns. With one column we
+        // skip GREATEST entirely (Postgres allows it but the
+        // single-arg call adds noise). Both branches still wrap
+        // identifiers in double quotes to keep parsing strict.
+        const greatestExpr =
+          safeCols.length === 1
+            ? `MAX("${safeCols[0]}")`
+            : `GREATEST(${safeCols
+                .map((c) => `MAX("${c}")`)
+                .join(', ')})`;
+
         const result = await this.dataSource.query(
-          `
-          SELECT GREATEST(
-            MAX(CASE WHEN EXISTS (
-              SELECT 1 FROM information_schema.columns
-              WHERE table_name = $1 AND column_name = 'updated_at'
-            ) THEN updated_at ELSE NULL END),
-            MAX(created_at)
-          ) as last_activity
-          FROM "${safeTable}"
-        `,
-          [safeTable],
+          `SELECT ${greatestExpr} as last_activity FROM "${safeTable}"`,
         );
 
         const lastActivity = result[0]?.last_activity;

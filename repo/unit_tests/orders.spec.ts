@@ -150,19 +150,55 @@ describe('OrdersService', () => {
   describe('createOrder', () => {
     const storeAdminUser = { id: 'user-1', role: 'store_admin', store_id: 'store-1' };
 
+    // ─────────────────────────────────────────────────────────────────
+    // Helper: stub the SKU query-builder used by createOrder.
+    //
+    // After audit_report-2 P0-1 the lookup is:
+    //
+    //   skuRepo.createQueryBuilder('sku')
+    //     .leftJoinAndSelect('sku.product', 'product')
+    //     .where('sku.id IN (:...skuIds)', { skuIds })
+    //     .getMany();
+    //
+    // so the mock chain has to expose those exact methods. Each row also
+    // needs `product.store_id` populated because the store_admin
+    // ownership guard reads it. Helper centralises that so individual
+    // tests stay focused on the assertion they care about.
+    function stubSkuQuery(rows: any[]) {
+      const qb: any = {};
+      qb.leftJoinAndSelect = jest.fn().mockReturnValue(qb);
+      qb.where = jest.fn().mockReturnValue(qb);
+      qb.whereInIds = jest.fn().mockReturnValue(qb);
+      qb.getMany = jest.fn().mockResolvedValue(rows);
+      skuRepo.createQueryBuilder.mockReturnValue(qb);
+      return qb;
+    }
+
+    // Convenience: a SKU with its parent product attached, scoped to
+    // the store-admin user used by all happy-path tests.
+    function makeSkuInStore(
+      id: string,
+      priceCents: number,
+      memberPriceCents: number | null,
+      storeId: string,
+    ) {
+      return {
+        id,
+        price_cents: priceCents,
+        member_price_cents: memberPriceCents,
+        product_id: `prod-${id}`,
+        product: { id: `prod-${id}`, store_id: storeId },
+      };
+    }
+
     it('creates order with correct total computed from SKU prices', async () => {
       // No existing idempotency key
       idempotencyRepo.findOne.mockResolvedValue(null);
 
-      // Two SKUs with different prices
-      const skuA = { id: 'sku-a', price_cents: 500, member_price_cents: null };
-      const skuB = { id: 'sku-b', price_cents: 1200, member_price_cents: 1000 };
-
-      const qb = {
-        whereInIds: jest.fn().mockReturnThis(),
-        getMany: jest.fn().mockResolvedValue([skuA, skuB]),
-      };
-      skuRepo.createQueryBuilder.mockReturnValue(qb);
+      // Two SKUs with different prices, both in the caller's store.
+      const skuA = makeSkuInStore('sku-a', 500, null, 'store-1');
+      const skuB = makeSkuInStore('sku-b', 1200, 1000, 'store-1');
+      stubSkuQuery([skuA, skuB]);
 
       const fullOrder = buildOrder({ total_cents: 2500, items: [] });
       manager.findOne.mockResolvedValue(fullOrder);
@@ -255,12 +291,8 @@ describe('OrdersService', () => {
       // path would have matched a row in store-2 here, leaking it.
       idempotencyRepo.findOne.mockResolvedValue(null);
 
-      const skuA = { id: 'sku-a', price_cents: 500, member_price_cents: null };
-      const qb = {
-        whereInIds: jest.fn().mockReturnThis(),
-        getMany: jest.fn().mockResolvedValue([skuA]),
-      };
-      skuRepo.createQueryBuilder.mockReturnValue(qb);
+      const skuA = makeSkuInStore('sku-a', 500, null, 'store-1');
+      stubSkuQuery([skuA]);
       manager.findOne.mockResolvedValue(buildOrder({ id: 'fresh-order-id' }));
 
       const dto = {
@@ -340,12 +372,8 @@ describe('OrdersService', () => {
     it('applies resolved promotion and coupon discount to totals', async () => {
       idempotencyRepo.findOne.mockResolvedValue(null);
 
-      const skuA = { id: 'sku-a', price_cents: 1000, member_price_cents: null };
-      const qb = {
-        whereInIds: jest.fn().mockReturnThis(),
-        getMany: jest.fn().mockResolvedValue([skuA]),
-      };
-      skuRepo.createQueryBuilder.mockReturnValue(qb);
+      const skuA = makeSkuInStore('sku-a', 1000, null, 'store-1');
+      stubSkuQuery([skuA]);
 
       promotionsService.resolvePromotions.mockResolvedValue({
         selectedPromotion: { id: 'promo-1' },
@@ -379,6 +407,130 @@ describe('OrdersService', () => {
         discount_cents: 250,
         promotion_id: 'promo-1',
         coupon_id: 'coupon-1',
+      });
+    });
+
+    // ─────────────────────────────────────────────────────────────────
+    // audit_report-2 P0-1: store-bound SKU ownership in createOrder.
+    //
+    // store_admin must only be able to order SKUs whose parent product
+    // belongs to their own store. Out-of-store SKUs surface as 404 to
+    // match the hiding policy used for paper/question reads — never
+    // 403, so a probing caller can't tell whether a SKU id exists in
+    // another store. No order row is persisted on the denied path.
+    // ─────────────────────────────────────────────────────────────────
+    describe('P0-1: store-bound SKU ownership', () => {
+      it('store_admin: foreign-store SKU → NotFoundException, no transaction', async () => {
+        idempotencyRepo.findOne.mockResolvedValue(null);
+        // SKU exists, but its parent product is in a different store.
+        const foreignSku = makeSkuInStore('sku-foreign', 999, null, 'store-OTHER');
+        stubSkuQuery([foreignSku]);
+
+        await expect(
+          service.createOrder(
+            {
+              idempotencyKey: 'cross-store-sku',
+              items: [{ skuId: 'sku-foreign', quantity: 1 }],
+            },
+            storeAdminUser,
+          ),
+        ).rejects.toThrow(NotFoundException);
+
+        // Defense in depth: nothing was persisted, no order row was
+        // created, no idempotency record landed.
+        expect(dataSource.transaction).not.toHaveBeenCalled();
+      });
+
+      it('store_admin: SKU with no product → NotFoundException', async () => {
+        // Edge case: a SKU row exists but its product join is null.
+        // We must NOT silently treat that as in-scope. Treat it as
+        // "missing" — same hiding policy.
+        idempotencyRepo.findOne.mockResolvedValue(null);
+        const orphanSku = {
+          id: 'sku-orphan',
+          price_cents: 100,
+          member_price_cents: null,
+          product_id: null,
+          product: null,
+        };
+        stubSkuQuery([orphanSku]);
+
+        await expect(
+          service.createOrder(
+            {
+              idempotencyKey: 'orphan-sku',
+              items: [{ skuId: 'sku-orphan', quantity: 1 }],
+            },
+            storeAdminUser,
+          ),
+        ).rejects.toThrow(NotFoundException);
+
+        expect(dataSource.transaction).not.toHaveBeenCalled();
+      });
+
+      it('store_admin: own-store SKU → order is created normally', async () => {
+        idempotencyRepo.findOne.mockResolvedValue(null);
+        const ownSku = makeSkuInStore('sku-own', 1500, null, 'store-1');
+        stubSkuQuery([ownSku]);
+        manager.findOne.mockResolvedValue(buildOrder({ id: 'fresh-id' }));
+
+        const result = await service.createOrder(
+          {
+            idempotencyKey: 'own-store-key',
+            items: [{ skuId: 'sku-own', quantity: 1 }],
+          },
+          storeAdminUser,
+        );
+
+        expect(result.alreadyExisted).toBe(false);
+        expect(dataSource.transaction).toHaveBeenCalled();
+      });
+
+      it('store_admin: mixed cart with one foreign SKU → entire order rejected', async () => {
+        // Even if 4 of 5 items are in scope, one foreign SKU must
+        // tank the whole request. Partial-success would leak which
+        // SKU ids exist outside the caller's store.
+        idempotencyRepo.findOne.mockResolvedValue(null);
+        const ownSku = makeSkuInStore('sku-own', 100, null, 'store-1');
+        const foreignSku = makeSkuInStore('sku-foreign', 100, null, 'store-OTHER');
+        stubSkuQuery([ownSku, foreignSku]);
+
+        await expect(
+          service.createOrder(
+            {
+              idempotencyKey: 'mixed-cart',
+              items: [
+                { skuId: 'sku-own', quantity: 1 },
+                { skuId: 'sku-foreign', quantity: 1 },
+              ],
+            },
+            storeAdminUser,
+          ),
+        ).rejects.toThrow(NotFoundException);
+
+        expect(dataSource.transaction).not.toHaveBeenCalled();
+      });
+
+      it('platform_admin: cross-store SKU is allowed (existing behaviour preserved)', async () => {
+        // platform_admin retains the cross-store admin capability.
+        // This is the regression guard that proves the tightening is
+        // store_admin-only and doesn't break the admin path.
+        idempotencyRepo.findOne.mockResolvedValue(null);
+        const skuFar = makeSkuInStore('sku-far', 200, null, 'store-X');
+        stubSkuQuery([skuFar]);
+        manager.findOne.mockResolvedValue(buildOrder({ id: 'platform-order' }));
+
+        const platformAdmin = { id: 'pa-1', role: 'platform_admin' };
+        const result = await service.createOrder(
+          {
+            idempotencyKey: 'pa-cross',
+            items: [{ skuId: 'sku-far', quantity: 1 }],
+          },
+          platformAdmin,
+        );
+
+        expect(result.alreadyExisted).toBe(false);
+        expect(dataSource.transaction).toHaveBeenCalled();
       });
     });
   });

@@ -102,3 +102,14 @@ Solution: Add distribute endpoint that creates claims for specified users.
 Question: The data model has `sku_price_tiers` as a separate table, but there's no explicit endpoint for managing price tiers. Should they have their own CRUD or be managed inline with SKU create/update?
 My Understanding/Hypothesis: Managed inline — when creating or updating a SKU, include a `priceTiers` array in the request body. No standalone price tier endpoints.
 Solution: SKU create/update DTOs accept optional `priceTiers: [{tierName, priceCents}]`. Service handles upsert/delete of tiers within the SKU transaction.
+
+## 21) Question Answer Versioning — Is It In Scope?
+Question: The prompt requires versioning for question content but doesn't explicitly state whether **answers/options** themselves are version-tracked, or only the textual **explanations**. Should `question_options` carry version metadata so that historical attempts always grade against the option set that was live at submission time?
+My Understanding/Hypothesis: Out of scope. The prompt mentions versioning in the context of (a) seat maps (immutable published snapshots) and (b) question **explanations** (so the canonical "why this answer is correct" rationale evolves without losing history). It does NOT call out the answer/option set as version-tracked, and the data model intentionally treats `question_options` as a mutable extension of the question itself — editing an option after attempts exist is a content-correction action, not a versioned change.
+Solution: Versioning is implemented at TWO concrete locations and NO others:
+1. `seat_map_versions` table — immutable seat-map snapshots with monotone `version_number` per `room_id`, enforced by the `UNIQUE (room_id, version_number)` constraint and the publish flow in the rooms module.
+2. `question_explanations` table — explanation history with monotone `version_number` per `question_id`, enforced by `UNIQUE (question_id, version_number)` and the auto-increment in `QuestionsService.addExplanation`.
+
+Anything else (`question_options`, `attempt_answers`, `papers`, `attempts`) is intentionally **non-versioned** — these are either mutable working state, immutable history rows, or pure derivatives of the rule. A unit test in `unit_tests/quality.spec.ts` (and a complementary entity-metadata check in `unit_tests/auth.spec.ts`) asserts the versioning surface so that anyone adding a `version_number` column to a non-versioned entity in the future trips a regression test before the change ever lands.
+
+audit_report-2 P1-7: this entry exists specifically so future readers (and future audits) have a written, tested source of truth for the versioning policy rather than having to infer it from the schema.

@@ -10,6 +10,7 @@ import {
   UseGuards,
   HttpCode,
   HttpStatus,
+  ForbiddenException,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -37,6 +38,33 @@ export class PromotionsController {
     private readonly auditService: AuditService,
   ) {}
 
+  /**
+   * Resolves the effective store filter for the calling user.
+   *
+   * audit_report-2 P0-5: previously each list/create/update/delete
+   * controller branch did `user.role === 'store_admin' ? user.storeId
+   * : undefined`. If the JWT carried role=store_admin with no storeId
+   * (a broken role/store invariant — see auth.service P0-5 fix), this
+   * silently passed `undefined` to the service, which then returned
+   * EVERY store's promotions/coupons. That's both a tenant-isolation
+   * leak AND an inconsistency with how every other store-scoped
+   * service (orders, products, questions) fails fast.
+   *
+   * This helper centralises the resolution and throws 403 if a
+   * store_admin reaches it without an assigned store. Non-store_admin
+   * callers are returned `undefined` (no scope filter).
+   */
+  private resolveStoreScope(user: any): string | undefined {
+    if (user?.role !== 'store_admin') {
+      return undefined;
+    }
+    const storeId = user?.storeId ?? user?.store_id ?? null;
+    if (!storeId) {
+      throw new ForbiddenException('Store admin has no assigned store');
+    }
+    return storeId;
+  }
+
   // ---- Promotions ----
 
   @Get('promotions')
@@ -44,7 +72,7 @@ export class PromotionsController {
   @ApiOperation({ summary: 'List promotions' })
   @ApiResponse({ status: 200, description: 'List of promotions' })
   findPromotions(@CurrentUser() user: any) {
-    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
+    const storeId = this.resolveStoreScope(user);
     return this.promotionsService.findPromotions(storeId);
   }
 
@@ -57,8 +85,11 @@ export class PromotionsController {
     @CurrentUser() user: any,
     @TraceId() traceId?: string,
   ) {
-    if (user.role === 'store_admin') {
-      dto.storeId = user.storeId;
+    const callerStoreId = this.resolveStoreScope(user);
+    if (callerStoreId) {
+      // store_admin: pin storeId to JWT scope, ignoring whatever the
+      // body claimed. Non-store_admin keeps caller-supplied storeId.
+      dto.storeId = callerStoreId;
     }
     const promotion = await this.promotionsService.createPromotion(dto);
     await this.auditService.log(
@@ -82,7 +113,7 @@ export class PromotionsController {
     @CurrentUser() user: any,
     @TraceId() traceId?: string,
   ) {
-    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
+    const storeId = this.resolveStoreScope(user);
     return this.promotionsService.updatePromotion(id, dto, storeId).then(async (promotion) => {
       await this.auditService.log(
         user.id,
@@ -106,7 +137,7 @@ export class PromotionsController {
     @CurrentUser() user: any,
     @TraceId() traceId?: string,
   ) {
-    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
+    const storeId = this.resolveStoreScope(user);
     return this.promotionsService.deletePromotion(id, storeId).then(async () => {
       await this.auditService.log(
         user.id,
@@ -127,7 +158,7 @@ export class PromotionsController {
   @ApiOperation({ summary: 'List coupons' })
   @ApiResponse({ status: 200, description: 'List of coupons' })
   findCoupons(@CurrentUser() user: any) {
-    const storeId = user.role === 'store_admin' ? user.storeId : undefined;
+    const storeId = this.resolveStoreScope(user);
     return this.promotionsService.findCoupons(storeId);
   }
 
@@ -140,8 +171,11 @@ export class PromotionsController {
     @CurrentUser() user: any,
     @TraceId() traceId?: string,
   ) {
-    if (user.role === 'store_admin') {
-      dto.storeId = user.storeId;
+    const callerStoreId = this.resolveStoreScope(user);
+    if (callerStoreId) {
+      // store_admin: pin storeId to JWT scope, ignoring whatever the
+      // body claimed. Non-store_admin keeps caller-supplied storeId.
+      dto.storeId = callerStoreId;
     }
     const coupon = await this.promotionsService.createCoupon(dto);
     await this.auditService.log(
@@ -176,7 +210,11 @@ export class PromotionsController {
     // let the read-only `auditor` role mutate coupon state. The
     // restriction here aligns claim with the rest of the coupon write
     // surfaces (`POST /coupons`, `/distribute`, `/expire`).
-    const claim = await this.promotionsService.claimCoupon(code, user.id);
+    //
+    // audit_report-2 P0-2: pass the FULL user context (not just `id`)
+    // so the service can enforce coupon.store_id ownership for
+    // store_admin via the same hiding policy as distribute/redeem.
+    const claim = await this.promotionsService.claimCoupon(code, user);
     await this.auditService.log(
       user.id,
       'claim_coupon',

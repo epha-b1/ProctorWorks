@@ -101,11 +101,56 @@ describe('QualityService', () => {
     });
   });
 
+  // ─── audit_report-2 P1-6: freshness query robustness ─────────────
+  //
+  // checkFreshness() now runs in two phases per table:
+  //   1. metadata probe — query information_schema.columns to learn
+  //      which timestamp columns exist
+  //   2. dynamic GREATEST(...) using only the columns we know are
+  //      present
+  //
+  // The previous SQL embedded `MAX(updated_at)` literally inside a
+  // CASE WHEN EXISTS subquery — that doesn't work because Postgres
+  // parses the column reference at plan time and fails for any table
+  // without updated_at (products, questions, inventory_lots).
+  //
+  // Helper builds a `dataSource.query` mock whose ORDERED responses
+  // line up with the per-table loop: for each entity type, the first
+  // call gets the metadata response, the second gets the activity
+  // result. Tests below configure these per case.
   describe('freshness check', () => {
-    it('creates notification when data is stale', async () => {
+    // ALL_ENTITY_TYPES inside the service is:
+    //   ['products', 'orders', 'questions', 'users', 'inventory']
+    // Each table goes through (metadata-probe → activity-query) so
+    // each iteration consumes 1 or 2 mock calls depending on whether
+    // the metadata reports any timestamp columns.
+    function pushTablePair(
+      mock: jest.Mock,
+      columns: string[],
+      lastActivity: string | null,
+    ) {
+      // Phase 1: metadata probe response
+      mock.mockResolvedValueOnce(
+        columns.map((c) => ({ column_name: c })),
+      );
+      // Phase 2: activity query response — only fires if columns
+      // is non-empty (the service skips the activity query when
+      // there are no timestamp columns).
+      if (columns.length > 0) {
+        mock.mockResolvedValueOnce([{ last_activity: lastActivity }]);
+      }
+    }
+
+    it('creates notification when data is stale (table has updated_at)', async () => {
       const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-      dataSource.query.mockResolvedValue([{ last_activity: oldDate }]);
+      // Mock the loop for all 5 entity types: every one returns
+      // updated_at + created_at with a stale timestamp.
+      for (let i = 0; i < 5; i++) {
+        pushTablePair(dataSource.query, ['updated_at', 'created_at'], oldDate);
+      }
+
       await service.checkFreshness();
+
       expect(notificationsService.createForAdmins).toHaveBeenCalledWith(
         'data_staleness',
         expect.stringContaining('has not been updated'),
@@ -114,9 +159,123 @@ describe('QualityService', () => {
 
     it('does not notify when data is fresh', async () => {
       const freshDate = new Date().toISOString();
-      dataSource.query.mockResolvedValue([{ last_activity: freshDate }]);
+      for (let i = 0; i < 5; i++) {
+        pushTablePair(
+          dataSource.query,
+          ['updated_at', 'created_at'],
+          freshDate,
+        );
+      }
+
       await service.checkFreshness();
+
       expect(notificationsService.createForAdmins).not.toHaveBeenCalled();
+    });
+
+    // ─── P1-6 robustness: works for tables WITHOUT updated_at ───
+    //
+    // The new metadata-driven path must produce a valid SELECT for
+    // tables that only carry `created_at` (e.g. products, questions,
+    // inventory_lots). The previous code generated invalid SQL here
+    // and the per-table try/catch swallowed the error silently —
+    // meaning freshness checks were silently no-ops on those tables.
+    it('handles tables that only have created_at without raising', async () => {
+      const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      for (let i = 0; i < 5; i++) {
+        pushTablePair(dataSource.query, ['created_at'], oldDate);
+      }
+
+      await service.checkFreshness();
+
+      // Critical: the activity query must have been issued (i.e.
+      // the code didn't crash on the metadata phase). The
+      // notification should still fire because the date is stale.
+      expect(notificationsService.createForAdmins).toHaveBeenCalled();
+
+      // Inspect the SQL strings sent to dataSource.query: NO call
+      // should reference `updated_at` for created_at-only tables.
+      const queries = dataSource.query.mock.calls.map((c: any[]) =>
+        String(c[0]),
+      );
+      const activityQueries = queries.filter((q: string) =>
+        q.includes('last_activity'),
+      );
+      for (const q of activityQueries) {
+        // For created_at-only mocks, the rendered SQL must reference
+        // MAX("created_at") and NEVER MAX("updated_at"). This is
+        // the regression-proof for the freshness fix.
+        expect(q).toContain('"created_at"');
+        expect(q).not.toContain('"updated_at"');
+      }
+    });
+
+    it('skips tables with neither updated_at nor created_at (no crash)', async () => {
+      // Edge case: a hypothetical table with no timestamp columns at
+      // all. The freshness loop must NOT issue an activity query
+      // (it would have nothing to MAX) and must NOT raise.
+      for (let i = 0; i < 5; i++) {
+        pushTablePair(dataSource.query, [], null);
+      }
+
+      await service.checkFreshness();
+
+      expect(notificationsService.createForAdmins).not.toHaveBeenCalled();
+
+      // Only metadata probes ran — no activity queries.
+      const queries = dataSource.query.mock.calls.map((c: any[]) =>
+        String(c[0]),
+      );
+      const activityQueries = queries.filter((q: string) =>
+        q.includes('last_activity'),
+      );
+      expect(activityQueries).toHaveLength(0);
+    });
+
+    it('uses GREATEST when both updated_at and created_at exist', async () => {
+      const oldDate = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      for (let i = 0; i < 5; i++) {
+        pushTablePair(
+          dataSource.query,
+          ['updated_at', 'created_at'],
+          oldDate,
+        );
+      }
+
+      await service.checkFreshness();
+
+      // Verify the SELECT actually uses GREATEST so the activity
+      // signal is the LATEST timestamp, not just one of them.
+      const queries = dataSource.query.mock.calls.map((c: any[]) =>
+        String(c[0]),
+      );
+      const activityQueries = queries.filter((q: string) =>
+        q.includes('last_activity'),
+      );
+      for (const q of activityQueries) {
+        expect(q).toContain('GREATEST');
+        expect(q).toContain('"updated_at"');
+        expect(q).toContain('"created_at"');
+      }
+    });
+
+    it('per-table failure does not abort the whole loop', async () => {
+      // First metadata probe throws, but the next 4 tables still
+      // need to be processed (the existing try/catch is a feature,
+      // not a bug — we keep it).
+      const freshDate = new Date().toISOString();
+      dataSource.query.mockReset();
+      dataSource.query.mockRejectedValueOnce(new Error('fake metadata fail'));
+      // Remaining 4 tables: provide normal pairs.
+      for (let i = 0; i < 4; i++) {
+        pushTablePair(
+          dataSource.query,
+          ['updated_at', 'created_at'],
+          freshDate,
+        );
+      }
+
+      // Must not throw — the try/catch wraps each table iteration.
+      await expect(service.checkFreshness()).resolves.toBeUndefined();
     });
   });
 

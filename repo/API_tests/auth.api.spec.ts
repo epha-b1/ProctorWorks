@@ -49,6 +49,11 @@ describe('Auth & Users API', () => {
   let app: INestApplication;
   let server: any;
   let adminToken: string;
+  // audit_report-2 P0-5: every store_admin user the suite creates now
+  // needs a real storeId. We provision a single throw-away store
+  // up-front and reuse its id everywhere — keeps the test data
+  // hermetic and avoids having to reach into the seed migration.
+  let testStoreId: string;
 
   beforeAll(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -64,6 +69,13 @@ describe('Auth & Users API', () => {
 
     // Obtain an admin JWT for use in protected-endpoint tests
     adminToken = await login(server, 'admin', 'Admin1234!');
+
+    // P0-5: provision the test store before any user creation runs.
+    const storeRes = await request(server)
+      .post('/stores')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ name: `AuthSpecStore-${UNIQUE}` });
+    testStoreId = storeRes.body.id;
   }, 30_000);
 
   afterAll(async () => {
@@ -149,6 +161,7 @@ describe('Auth & Users API', () => {
           username: logoutUser,
           password: 'Logout1234!',
           role: 'store_admin',
+          storeId: testStoreId,
         });
       logoutToken = await login(server, logoutUser, 'Logout1234!');
     });
@@ -214,6 +227,7 @@ describe('Auth & Users API', () => {
           username: cpUser,
           password: 'Original1234!',
           role: 'store_admin',
+          storeId: testStoreId,
         });
 
       cpToken = await login(server, cpUser, 'Original1234!');
@@ -294,6 +308,7 @@ describe('Auth & Users API', () => {
           username: newUser,
           password: 'Passw0rd!',
           role: 'store_admin',
+          storeId: testStoreId,
         });
       logStep('POST', '/users', res.status);
 
@@ -312,6 +327,7 @@ describe('Auth & Users API', () => {
           username: newUser,
           password: 'Passw0rd!',
           role: 'store_admin',
+          storeId: testStoreId,
         });
       logStep('POST', '/users', res.status);
 
@@ -335,6 +351,7 @@ describe('Auth & Users API', () => {
           username: patchUser,
           password: 'Passw0rd!',
           role: 'store_admin',
+          storeId: testStoreId,
         });
       userId = res.body.id;
     });
@@ -377,6 +394,7 @@ describe('Auth & Users API', () => {
           username: lockUser,
           password: 'Correct1234!',
           role: 'store_admin',
+          storeId: testStoreId,
         });
     });
 

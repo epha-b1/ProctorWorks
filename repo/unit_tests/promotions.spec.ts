@@ -1,4 +1,8 @@
-import { BadRequestException, NotFoundException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { PromotionsService } from '../src/promotions/promotions.service';
 import {
   Promotion,
@@ -263,6 +267,12 @@ describe('PromotionsService', () => {
   /*  8-11. claimCoupon                                              */
   /* -------------------------------------------------------------- */
   describe('claimCoupon', () => {
+    // After audit_report-2 P0-2, claimCoupon takes the FULL `user`
+    // context (not just `userId`). Existing tests pass a platform
+    // admin user object so the store-scope guard becomes a no-op
+    // (admin role bypasses scoping).
+    const platformAdmin = { id: 'user-1', role: 'platform_admin' };
+
     it('active coupon -> creates claim and decrements remaining_quantity', async () => {
       const { service, couponRepo, claimRepo } = createService();
 
@@ -272,7 +282,7 @@ describe('PromotionsService', () => {
       const savedClaim = { id: 'claim-1', coupon_id: coupon.id, user_id: 'user-1' };
       claimRepo.save.mockResolvedValue(savedClaim);
 
-      const result = await service.claimCoupon('SAVE10', 'user-1');
+      const result = await service.claimCoupon('SAVE10', platformAdmin);
 
       expect(claimRepo.create).toHaveBeenCalledWith(
         expect.objectContaining({ coupon_id: coupon.id, user_id: 'user-1' }),
@@ -289,9 +299,9 @@ describe('PromotionsService', () => {
       const coupon = makeCoupon({ status: CouponStatus.EXPIRED });
       couponRepo.findOne.mockResolvedValue(coupon);
 
-      await expect(service.claimCoupon('SAVE10', 'user-1')).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        service.claimCoupon('SAVE10', platformAdmin),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('exhausted coupon -> throws BadRequestException', async () => {
@@ -300,9 +310,9 @@ describe('PromotionsService', () => {
       const coupon = makeCoupon({ status: CouponStatus.EXHAUSTED });
       couponRepo.findOne.mockResolvedValue(coupon);
 
-      await expect(service.claimCoupon('SAVE10', 'user-1')).rejects.toThrow(
-        BadRequestException,
-      );
+      await expect(
+        service.claimCoupon('SAVE10', platformAdmin),
+      ).rejects.toThrow(BadRequestException);
     });
 
     it('remaining_quantity reaches 0 -> sets status=exhausted', async () => {
@@ -312,13 +322,102 @@ describe('PromotionsService', () => {
       couponRepo.findOne.mockResolvedValue(coupon);
       claimRepo.save.mockResolvedValue({ id: 'claim-1' });
 
-      await service.claimCoupon('SAVE10', 'user-1');
+      await service.claimCoupon('SAVE10', platformAdmin);
 
       expect(coupon.remaining_quantity).toBe(0);
       expect(coupon.status).toBe(CouponStatus.EXHAUSTED);
       expect(couponRepo.save).toHaveBeenCalledWith(
         expect.objectContaining({ status: CouponStatus.EXHAUSTED }),
       );
+    });
+
+    // ---------------------------------------------------------------
+    // audit_report-2 P0-2: tenant binding on claim.
+    //
+    // store_admin must NOT be able to claim a coupon belonging to
+    // another store. The guard runs BEFORE the usability check so
+    // the foreign coupon's status is never leaked through the error
+    // message — the caller just sees 404 (hiding policy).
+    // ---------------------------------------------------------------
+    describe('P0-2: store-scoped object authorization', () => {
+      const storeAdminA = {
+        id: 'sa-a',
+        role: 'store_admin',
+        storeId: 'store-A',
+      };
+      const storeAdminNone = {
+        id: 'sa-x',
+        role: 'store_admin',
+        storeId: null,
+      };
+
+      it('store_admin: foreign-store coupon → NotFoundException, no claim, no decrement', async () => {
+        const { service, couponRepo, claimRepo } = createService();
+        const foreignCoupon = makeCoupon({
+          store_id: 'store-OTHER',
+          remaining_quantity: 5,
+        });
+        couponRepo.findOne.mockResolvedValue(foreignCoupon);
+
+        await expect(
+          service.claimCoupon('FOREIGN-CODE', storeAdminA),
+        ).rejects.toThrow(NotFoundException);
+
+        // No claim row was saved, no remaining_quantity mutation,
+        // no second couponRepo.save call (the one inside the
+        // remaining-quantity decrement path).
+        expect(claimRepo.save).not.toHaveBeenCalled();
+        expect(couponRepo.save).not.toHaveBeenCalled();
+        expect(foreignCoupon.remaining_quantity).toBe(5);
+      });
+
+      it('store_admin: same-store coupon → claim works and decrements', async () => {
+        const { service, couponRepo, claimRepo } = createService();
+        const ownCoupon = makeCoupon({
+          store_id: 'store-A',
+          remaining_quantity: 3,
+        });
+        couponRepo.findOne.mockResolvedValue(ownCoupon);
+        claimRepo.save.mockResolvedValue({ id: 'claim-own', coupon_id: ownCoupon.id });
+
+        const result = await service.claimCoupon('OWN-CODE', storeAdminA);
+
+        expect(result).toBeDefined();
+        expect(ownCoupon.remaining_quantity).toBe(2);
+        expect(claimRepo.create).toHaveBeenCalledWith(
+          expect.objectContaining({ user_id: 'sa-a' }),
+        );
+      });
+
+      it('unassigned store_admin → ForbiddenException (fail-fast on broken invariant)', async () => {
+        const { service, couponRepo, claimRepo } = createService();
+        const someCoupon = makeCoupon({ store_id: 'store-A' });
+        couponRepo.findOne.mockResolvedValue(someCoupon);
+
+        await expect(
+          service.claimCoupon('SOME-CODE', storeAdminNone),
+        ).rejects.toThrow(ForbiddenException);
+
+        expect(claimRepo.save).not.toHaveBeenCalled();
+        expect(couponRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('foreign-store coupon scope check runs BEFORE usability check (no status leak)', async () => {
+        // Critical ordering: even if the foreign coupon is also
+        // EXPIRED/EXHAUSTED, the caller must see 404 (hiding), not
+        // 400 ("expired") which would confirm the code exists.
+        const { service, couponRepo } = createService();
+        const exhaustedForeign = makeCoupon({
+          store_id: 'store-OTHER',
+          remaining_quantity: 0,
+          status: CouponStatus.EXHAUSTED,
+        });
+        couponRepo.findOne.mockResolvedValue(exhaustedForeign);
+
+        await expect(
+          service.claimCoupon('FOREIGN-EXHAUSTED', storeAdminA),
+        ).rejects.toThrow(NotFoundException);
+      });
     });
   });
 

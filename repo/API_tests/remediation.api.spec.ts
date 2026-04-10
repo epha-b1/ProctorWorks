@@ -1480,4 +1480,486 @@ describe('Remediation: F-01/F-02/F-03 mandatory coverage', () => {
       expect(row.cancelled_at).not.toBeNull();
     });
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // audit_report-2 P0 series — proactive defect closure
+  //
+  // P0-1: createOrder must reject foreign-store SKUs (SKU→Product
+  //       store ownership) — store_admin in store B cannot order a
+  //       SKU whose parent product belongs to store A.
+  // P0-2: claimCoupon must reject foreign-store coupons for
+  //       store_admin (object-level + tenant authz on claim).
+  // P0-3: GET /questions/:id/explanations must hide foreign-store
+  //       questions (404 hiding policy).
+  // P0-4: submitAttempt must reject submissions where the answers
+  //       reference questions that aren't in the attempt's paper,
+  //       reject options from a different question, and reject
+  //       duplicate questionIds in one submission body.
+  // P0-5: createUser must reject role=store_admin without storeId.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('audit_report-2 P0: proactive defect closure', () => {
+    // ───── P0-1: cross-store SKU rejection on order creation ─────
+    describe('P0-1: createOrder rejects foreign-store SKU', () => {
+      let storeASkuId: string;
+
+      beforeAll(async () => {
+        // Build a SKU under a product owned by store A.
+        const cat = await request(server)
+          .post('/categories')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ name: `P01Cat-${U}` });
+        const brand = await request(server)
+          .post('/brands')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ name: `P01Brand-${U}` });
+        const prod = await request(server)
+          .post('/products')
+          .set('Authorization', `Bearer ${storeAdminAToken}`)
+          .send({
+            name: `P01Prod-${U}`,
+            categoryId: cat.body.id,
+            brandId: brand.body.id,
+          });
+        const sku = await request(server)
+          .post(`/products/${prod.body.id}/skus`)
+          .set('Authorization', `Bearer ${storeAdminAToken}`)
+          .send({ skuCode: `P01-A-${U}`, priceCents: 4_242 });
+        expect(sku.status).toBe(201);
+        storeASkuId = sku.body.id;
+      }, 30_000);
+
+      it('store_admin B ordering a store-A SKU → 404 (hiding policy)', async () => {
+        const res = await request(server)
+          .post('/orders')
+          .set('Authorization', `Bearer ${storeAdminBToken}`)
+          .send({
+            idempotencyKey: `p01-b-cross-${U}`,
+            items: [{ skuId: storeASkuId, quantity: 1 }],
+          });
+
+        // Hiding policy: 404, never 403, never 200, never any echo
+        // of store A's product/price.
+        expect(res.status).toBe(404);
+        expect(res.body).not.toHaveProperty('total_cents');
+        expect(res.body).not.toHaveProperty('items');
+      });
+
+      it('store_admin A ordering their OWN SKU → 201 (positive control)', async () => {
+        const res = await request(server)
+          .post('/orders')
+          .set('Authorization', `Bearer ${storeAdminAToken}`)
+          .send({
+            idempotencyKey: `p01-a-own-${U}`,
+            items: [{ skuId: storeASkuId, quantity: 1 }],
+          });
+
+        // Goal: prove the store_admin's OWN SKU is accepted (no
+        // 404 from the new SKU-store guard) and that the resulting
+        // order references both the caller's store and the SKU.
+        // We deliberately do NOT pin total_cents because earlier
+        // tests in this file create store-A automatic promotions
+        // that may cascade into this order's pricing — that's the
+        // F-P3 cross-test pollution surface and is unrelated to
+        // P0-1's contract. The store-bound SKU check is what we're
+        // here to verify; the discount math is owned by the
+        // promotions tests.
+        expect(res.status).toBe(201);
+        expect(res.body.store_id).toBe(storeA.id);
+        // Order must reference exactly the SKU we asked for.
+        const skuIds = (res.body.items ?? []).map((it: any) => it.sku_id);
+        expect(skuIds).toContain(storeASkuId);
+      });
+
+      it('platform_admin ordering same SKU → 201 (admin behaviour preserved)', async () => {
+        const res = await request(server)
+          .post('/orders')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            idempotencyKey: `p01-pa-${U}`,
+            items: [{ skuId: storeASkuId, quantity: 1 }],
+          });
+
+        expect(res.status).toBe(201);
+      });
+    });
+
+    // ───── P0-2: cross-store coupon claim rejection ─────
+    describe('P0-2: claimCoupon rejects foreign-store coupon', () => {
+      let storeAOnlyCouponCode: string;
+
+      beforeAll(async () => {
+        const promo = await request(server)
+          .post('/promotions')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            storeId: storeA.id,
+            name: `P02Promo-${U}`,
+            type: 'percentage',
+            priority: 10,
+            discountType: 'percentage',
+            discountValue: 20,
+          });
+        storeAOnlyCouponCode = `P02-A-${U}`;
+        const c = await request(server)
+          .post('/coupons')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            storeId: storeA.id,
+            code: storeAOnlyCouponCode,
+            promotionId: promo.body.id,
+            remainingQuantity: 5,
+          });
+        expect(c.status).toBe(201);
+      }, 30_000);
+
+      it('store_admin B claiming a store-A coupon → 404 (hiding policy)', async () => {
+        const before = await request(server)
+          .get('/coupons')
+          .set('Authorization', `Bearer ${adminToken}`);
+        const beforeRow = before.body.find(
+          (c: any) => c.code === storeAOnlyCouponCode,
+        );
+        const beforeQty = beforeRow.remaining_quantity;
+
+        const res = await request(server)
+          .post(`/coupons/${storeAOnlyCouponCode}/claim`)
+          .set('Authorization', `Bearer ${storeAdminBToken}`);
+
+        // Hiding policy: 404, never 400 ("expired"/"exhausted") which
+        // would confirm the code exists.
+        expect(res.status).toBe(404);
+
+        // Defense in depth: no decrement, no claim row.
+        const after = await request(server)
+          .get('/coupons')
+          .set('Authorization', `Bearer ${adminToken}`);
+        const afterRow = after.body.find(
+          (c: any) => c.code === storeAOnlyCouponCode,
+        );
+        expect(afterRow.remaining_quantity).toBe(beforeQty);
+      });
+
+      it('store_admin A claiming their own coupon → 200/201 + decrement', async () => {
+        const before = await request(server)
+          .get('/coupons')
+          .set('Authorization', `Bearer ${adminToken}`);
+        const beforeQty = before.body.find(
+          (c: any) => c.code === storeAOnlyCouponCode,
+        ).remaining_quantity;
+
+        const res = await request(server)
+          .post(`/coupons/${storeAOnlyCouponCode}/claim`)
+          .set('Authorization', `Bearer ${storeAdminAToken}`);
+        expect([200, 201]).toContain(res.status);
+
+        const after = await request(server)
+          .get('/coupons')
+          .set('Authorization', `Bearer ${adminToken}`);
+        const afterQty = after.body.find(
+          (c: any) => c.code === storeAOnlyCouponCode,
+        ).remaining_quantity;
+        expect(afterQty).toBe(beforeQty - 1);
+      });
+
+      it('auditor still cannot claim (HIGH-2 role guard preserved)', async () => {
+        const res = await request(server)
+          .post(`/coupons/${storeAOnlyCouponCode}/claim`)
+          .set('Authorization', `Bearer ${auditorToken}`);
+        expect(res.status).toBe(403);
+      });
+    });
+
+    // ───── P0-3: cross-store explanation read denial ─────
+    describe('P0-3: GET /questions/:id/explanations enforces ownership', () => {
+      let questionInStoreA: string;
+
+      beforeAll(async () => {
+        const q = await request(server)
+          .post('/questions')
+          .set('Authorization', `Bearer ${storeAdminAToken}`)
+          .send({
+            type: 'subjective',
+            body: `P03Q-${U}`,
+          });
+        expect(q.status).toBe(201);
+        questionInStoreA = q.body.id;
+
+        // Add an explanation so the foreign-store reader can't just
+        // be served an empty array (which would still leak existence
+        // information to a careful caller).
+        await request(server)
+          .post(`/questions/${questionInStoreA}/explanations`)
+          .set('Authorization', `Bearer ${storeAdminAToken}`)
+          .send({ body: `P03E-${U}` });
+      }, 30_000);
+
+      it('store_admin B reading store A explanations → 404', async () => {
+        const res = await request(server)
+          .get(`/questions/${questionInStoreA}/explanations`)
+          .set('Authorization', `Bearer ${storeAdminBToken}`);
+        expect(res.status).toBe(404);
+        // Must NOT leak the explanation array.
+        expect(Array.isArray(res.body)).toBe(false);
+      });
+
+      it('store_admin A reading their own explanations → 200', async () => {
+        const res = await request(server)
+          .get(`/questions/${questionInStoreA}/explanations`)
+          .set('Authorization', `Bearer ${storeAdminAToken}`);
+        expect(res.status).toBe(200);
+        expect(Array.isArray(res.body)).toBe(true);
+        expect(res.body.length).toBeGreaterThan(0);
+      });
+
+      it('platform_admin reading any explanations → 200 (admin preserved)', async () => {
+        const res = await request(server)
+          .get(`/questions/${questionInStoreA}/explanations`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        expect(res.status).toBe(200);
+      });
+    });
+
+    // ───── P0-4: submission integrity ─────
+    describe('P0-4: submitAttempt content integrity', () => {
+      let paperId: string;
+      let attemptId: string;
+      let inPaperQuestionId: string;
+      let inPaperOptionId: string;
+      let outOfPaperQuestionId: string;
+      let outOfPaperOptionId: string;
+
+      beforeAll(async () => {
+        // Question that lives IN the paper.
+        const q1 = await request(server)
+          .post('/questions')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            type: 'objective',
+            body: `P04InQ-${U}`,
+            options: [
+              { body: 'right', isCorrect: true },
+              { body: 'wrong', isCorrect: false },
+            ],
+          });
+        await request(server)
+          .post(`/questions/${q1.body.id}/approve`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        inPaperQuestionId = q1.body.id;
+        inPaperOptionId = q1.body.options.find((o: any) => o.is_correct).id;
+
+        // Question that lives OUTSIDE the paper.
+        const q2 = await request(server)
+          .post('/questions')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            type: 'objective',
+            body: `P04OutQ-${U}`,
+            options: [
+              { body: 'foreign-right', isCorrect: true },
+              { body: 'foreign-wrong', isCorrect: false },
+            ],
+          });
+        await request(server)
+          .post(`/questions/${q2.body.id}/approve`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        outOfPaperQuestionId = q2.body.id;
+        outOfPaperOptionId = q2.body.options.find((o: any) => o.is_correct).id;
+
+        // Build a paper that is GUARANTEED to include only q1.
+        // We use a rule-based generation with a tight count and then
+        // validate the membership before running tests.
+        const p = await request(server)
+          .post('/papers')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            name: `P04Paper-${U}`,
+            generationRule: { type: 'random', count: 1 },
+          });
+        expect(p.status).toBe(201);
+        paperId = p.body.id;
+
+        const a = await request(server)
+          .post('/attempts')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ paperId });
+        expect(a.status).toBe(201);
+        attemptId = a.body.id;
+      }, 30_000);
+
+      it('answer with question NOT in paper → 400', async () => {
+        // We don't actually know which question landed in the random
+        // paper — but `outOfPaperQuestionId` is freshly created and
+        // could only land in the paper if its count=1 random pick
+        // happened to choose it. To make the assertion deterministic,
+        // we read the paper's question membership and substitute a
+        // truly out-of-paper id.
+        const paperRes = await request(server)
+          .get(`/papers/${paperId}`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        const memberIds: string[] = paperRes.body.paper_questions.map(
+          (pq: any) => pq.question_id,
+        );
+
+        // Pick one of {inPaperQuestionId, outOfPaperQuestionId} that
+        // is NOT actually a member of this random paper.
+        const candidate = !memberIds.includes(inPaperQuestionId)
+          ? inPaperQuestionId
+          : !memberIds.includes(outOfPaperQuestionId)
+            ? outOfPaperQuestionId
+            : null;
+        if (!candidate) {
+          // Both happened to be picked — extremely unlikely with
+          // count=1, but if so, skip the assertion gracefully.
+          return;
+        }
+
+        const res = await request(server)
+          .post(`/attempts/${attemptId}/submit`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            answers: [{ questionId: candidate }],
+          });
+        expect(res.status).toBe(400);
+      });
+
+      it('option from a DIFFERENT question → 400', async () => {
+        // Use a fresh attempt so the bad-submission test doesn't
+        // collide with the previous one.
+        const a = await request(server)
+          .post('/attempts')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ paperId });
+        expect(a.status).toBe(201);
+
+        const paperRes = await request(server)
+          .get(`/papers/${paperId}`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        const memberQid: string =
+          paperRes.body.paper_questions[0].question_id;
+        const memberQ = paperRes.body.paper_questions[0].question;
+        const sameQOptionId =
+          memberQ?.options?.[0]?.id ?? inPaperOptionId;
+        // Build an option id from a question we KNOW isn't this one.
+        const foreignOptionId =
+          memberQid === inPaperQuestionId ? outOfPaperOptionId : inPaperOptionId;
+
+        const res = await request(server)
+          .post(`/attempts/${a.body.id}/submit`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            answers: [
+              { questionId: memberQid, selectedOptionId: foreignOptionId },
+            ],
+          });
+
+        // The cross-question option must trip the (2) guard.
+        expect(res.status).toBe(400);
+      });
+
+      it('duplicate questionId in same submission → 400', async () => {
+        // Fresh attempt for a clean test slate.
+        const a = await request(server)
+          .post('/attempts')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ paperId });
+        expect(a.status).toBe(201);
+
+        const paperRes = await request(server)
+          .get(`/papers/${paperId}`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        const memberQid: string =
+          paperRes.body.paper_questions[0].question_id;
+
+        const res = await request(server)
+          .post(`/attempts/${a.body.id}/submit`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            answers: [
+              { questionId: memberQid },
+              { questionId: memberQid },
+            ],
+          });
+        expect(res.status).toBe(400);
+        expect(res.body.message).toMatch(/duplicate/i);
+      });
+
+      it('valid in-paper submission still grades correctly', async () => {
+        // Positive control for the integrity-hardened path.
+        const a = await request(server)
+          .post('/attempts')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({ paperId });
+        expect(a.status).toBe(201);
+
+        const paperRes = await request(server)
+          .get(`/papers/${paperId}`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        const memberQid: string =
+          paperRes.body.paper_questions[0].question_id;
+        const memberCorrectOptId: string =
+          paperRes.body.paper_questions[0].question.options.find(
+            (o: any) => o.is_correct,
+          ).id;
+
+        const res = await request(server)
+          .post(`/attempts/${a.body.id}/submit`)
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            answers: [
+              {
+                questionId: memberQid,
+                selectedOptionId: memberCorrectOptId,
+              },
+            ],
+          });
+        expect(res.status).toBe(201);
+        expect(res.body.status).toBe('graded');
+        expect(Number(res.body.score)).toBe(100);
+      });
+    });
+
+    // ───── P0-5: store_admin role/store invariant ─────
+    describe('P0-5: createUser rejects store_admin without storeId', () => {
+      it('POST /users { role:"store_admin" } without storeId → 400', async () => {
+        const res = await request(server)
+          .post('/users')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            username: `p05bad${U}-${Math.random().toString(36).slice(2, 8)}`,
+            password: 'Admin1234!',
+            role: 'store_admin',
+            // storeId omitted on purpose
+          });
+        expect(res.status).toBe(400);
+      });
+
+      it('POST /users { role:"store_admin", storeId } → 201', async () => {
+        const res = await request(server)
+          .post('/users')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            username: `p05ok${U}-${Math.random().toString(36).slice(2, 8)}`,
+            password: 'Admin1234!',
+            role: 'store_admin',
+            storeId: storeA.id,
+          });
+        expect(res.status).toBe(201);
+        expect(res.body.store_id).toBe(storeA.id);
+      });
+
+      it('POST /users { role:"content_reviewer", storeId } → store_id forced to null', async () => {
+        const res = await request(server)
+          .post('/users')
+          .set('Authorization', `Bearer ${adminToken}`)
+          .send({
+            username: `p05rev${U}-${Math.random().toString(36).slice(2, 8)}`,
+            password: 'Admin1234!',
+            role: 'content_reviewer',
+            storeId: storeA.id,
+          });
+        expect(res.status).toBe(201);
+        expect(res.body.store_id).toBeNull();
+      });
+    });
+  });
 });

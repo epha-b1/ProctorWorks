@@ -105,21 +105,50 @@ export class OrdersService {
       );
     }
 
-    // 2. Look up SKU prices, compute subtotal
+    // 2. Look up SKU prices, compute subtotal.
+    //
+    //    audit_report-2 P0-1: store-bound SKU ownership.
+    //
+    //    Previously this fetched SKUs by id alone, with no awareness of
+    //    which store the SKU's parent product belonged to. A store_admin
+    //    in store A could place an order containing a SKU whose product
+    //    lives in store B — the order itself would be tagged store_id=A
+    //    (from the JWT scope) but its line items would reference foreign
+    //    inventory, breaking tenant isolation, leaking foreign SKU
+    //    existence/pricing, and potentially attributing revenue wrong.
+    //
+    //    Fix: join sku → product and pull product.store_id back. For
+    //    store_admin callers, every SKU must match `callerStoreId`.
+    //    Out-of-scope SKUs surface as 404 (NotFoundException) to match
+    //    the hiding-policy used elsewhere — never 403, so a probing
+    //    caller can't tell whether a SKU id exists in another store.
+    //    Other roles (platform_admin / content_reviewer) keep the
+    //    existing cross-store behaviour.
     const skuIds = dto.items.map((i) => i.skuId);
-    const skus = await this.skuRepo
+    const skuRows = await this.skuRepo
       .createQueryBuilder('sku')
-      .whereInIds(skuIds)
+      .leftJoinAndSelect('sku.product', 'product')
+      .where('sku.id IN (:...skuIds)', { skuIds })
       .getMany();
 
     const skuMap = new Map<string, Sku>();
-    for (const sku of skus) {
+    for (const sku of skuRows) {
       skuMap.set(sku.id, sku);
     }
 
     for (const item of dto.items) {
-      if (!skuMap.has(item.skuId)) {
+      const sku = skuMap.get(item.skuId);
+      if (!sku) {
         throw new NotFoundException(`SKU ${item.skuId} not found`);
+      }
+      // store_admin must only buy SKUs from their own store. The 404
+      // hiding policy means probing for foreign SKU ids is
+      // indistinguishable from probing for missing ids.
+      if (user?.role === 'store_admin') {
+        const skuProductStoreId = (sku as any).product?.store_id;
+        if (!skuProductStoreId || skuProductStoreId !== callerStoreId) {
+          throw new NotFoundException(`SKU ${item.skuId} not found`);
+        }
       }
     }
 

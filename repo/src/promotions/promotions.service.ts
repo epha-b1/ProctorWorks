@@ -104,7 +104,29 @@ export class PromotionsService {
     return this.couponRepo.save(coupon);
   }
 
-  async claimCoupon(code: string, userId: string): Promise<CouponClaim> {
+  /**
+   * Claims a coupon for the calling user.
+   *
+   * audit_report-2 P0-2: object-level + tenant authorization on claim.
+   *
+   * Previously this resolved the coupon by `code` alone and mutated
+   * `remaining_quantity` / created a CouponClaim row WITHOUT checking
+   * the caller's store scope. A store_admin in store B who knew (or
+   * guessed) a coupon code in store A could decrement that coupon and
+   * land a claim row attributed to themselves — cross-store discount
+   * abuse and a tenant-isolation break.
+   *
+   * Fix: take the FULL `user` context, not just `userId`, and run the
+   * coupon through `enforceCouponScope` (the same policy used by
+   * distribute / redeem / expire) BEFORE the usability check or any
+   * mutation. For store_admin callers, a coupon belonging to another
+   * store is indistinguishable from "not found" (404), matching the
+   * hiding policy used elsewhere in the module. The transaction is
+   * therefore guaranteed to roll back with no rows touched on the
+   * denied path.
+   */
+  async claimCoupon(code: string, user: any): Promise<CouponClaim> {
+    const userId: string = user?.id;
     return this.dataSource.transaction(async (manager) => {
       const couponRepo = manager.getRepository(Coupon);
       const claimRepo = manager.getRepository(CouponClaim);
@@ -113,6 +135,11 @@ export class PromotionsService {
       if (!coupon) {
         throw new NotFoundException('Coupon not found');
       }
+
+      // Tenant scope MUST run before assertCouponUsable so a foreign
+      // coupon's status (active/exhausted/expired) is never leaked
+      // through the error message — the caller just sees 404.
+      this.enforceCouponScope(coupon, user);
 
       this.assertCouponUsable(coupon);
 

@@ -482,11 +482,25 @@ describe('AssessmentsService', () => {
   describe('submitAttempt', () => {
     const userId = 'user-1';
     const attemptId = 'attempt-1';
+    const paperId = 'paper-1';
 
-    function setupSubmit() {
+    /**
+     * Sets up a submitAttempt fixture with the FULL set of repo
+     * stubs the service now needs after audit_report-2 P0-4:
+     *
+     *   - attemptRepo.findOne → an in-progress attempt for paperId
+     *   - paperQuestionRepo.find → membership rows for the given
+     *     question ids (so the (1) integrity guard passes)
+     *
+     * Tests pass `allowedQuestionIds` to control which question ids
+     * the membership query returns, so each test can isolate exactly
+     * one integrity branch.
+     */
+    function setupSubmit(allowedQuestionIds: string[] = ['q1', 'q2', 'q-sub']) {
       const ctx = buildService();
       ctx.attemptRepo.findOne.mockResolvedValue({
         id: attemptId,
+        paper_id: paperId,
         user_id: userId,
         status: AttemptStatus.IN_PROGRESS,
       });
@@ -495,6 +509,13 @@ describe('AssessmentsService', () => {
       );
       ctx.answerRepo.save.mockImplementation((entities: any) =>
         Promise.resolve(entities),
+      );
+      ctx.paperQuestionRepo.find.mockResolvedValue(
+        allowedQuestionIds.map((qid, idx) => ({
+          paper_id: paperId,
+          question_id: qid,
+          position: idx + 1,
+        })),
       );
       return ctx;
     }
@@ -508,6 +529,7 @@ describe('AssessmentsService', () => {
       });
       optionRepo.findOne.mockResolvedValue({
         id: 'opt-correct',
+        question_id: 'q1',
         is_correct: true,
       });
 
@@ -535,6 +557,7 @@ describe('AssessmentsService', () => {
       });
       optionRepo.findOne.mockResolvedValue({
         id: 'opt-wrong',
+        question_id: 'q1',
         is_correct: false,
       });
 
@@ -585,8 +608,8 @@ describe('AssessmentsService', () => {
         .mockResolvedValueOnce({ id: 'q2', type: QuestionType.OBJECTIVE });
 
       optionRepo.findOne
-        .mockResolvedValueOnce({ id: 'opt-1', is_correct: true })
-        .mockResolvedValueOnce({ id: 'opt-2', is_correct: false });
+        .mockResolvedValueOnce({ id: 'opt-1', question_id: 'q1', is_correct: true })
+        .mockResolvedValueOnce({ id: 'opt-2', question_id: 'q2', is_correct: false });
 
       await service.submitAttempt(
         attemptId,
@@ -610,6 +633,7 @@ describe('AssessmentsService', () => {
       });
       optionRepo.findOne.mockResolvedValue({
         id: 'opt-1',
+        question_id: 'q1',
         is_correct: true,
       });
 
@@ -650,6 +674,139 @@ describe('AssessmentsService', () => {
       await expect(
         service.submitAttempt(attemptId, [], userId),
       ).rejects.toThrow(BadRequestException);
+    });
+
+    // ---------------------------------------------------------------
+    // audit_report-2 P0-4: submission integrity hardening.
+    //
+    // Three guards must run BEFORE any answer row is persisted:
+    //   (1) every questionId must belong to attempt.paper_id
+    //   (2) selectedOptionId must hang off that same questionId
+    //   (3) duplicate questionIds in one submission are rejected
+    // All three surface as 400 (BadRequestException).
+    // ---------------------------------------------------------------
+    describe('P0-4: submission integrity', () => {
+      it('rejects answer with question not in attempt paper → 400', async () => {
+        // Allowed paper questions: q1. The submission tries q-foreign.
+        const { service, answerRepo } = setupSubmit(['q1']);
+
+        await expect(
+          service.submitAttempt(
+            attemptId,
+            [{ questionId: 'q-foreign', selectedOptionId: 'opt-x' }],
+            userId,
+          ),
+        ).rejects.toThrow(BadRequestException);
+
+        // Defense in depth: no answer row was saved on the denied path.
+        expect(answerRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('rejects option that belongs to a different question → 400', async () => {
+        const { service, questionRepo, optionRepo, answerRepo } = setupSubmit([
+          'q1',
+        ]);
+        questionRepo.findOne.mockResolvedValue({
+          id: 'q1',
+          type: QuestionType.OBJECTIVE,
+        });
+        // Crucially: the option exists, but its question_id is q2,
+        // not q1. The cross-question guard must reject this.
+        optionRepo.findOne.mockResolvedValue({
+          id: 'opt-from-q2',
+          question_id: 'q2',
+          is_correct: true,
+        });
+
+        await expect(
+          service.submitAttempt(
+            attemptId,
+            [{ questionId: 'q1', selectedOptionId: 'opt-from-q2' }],
+            userId,
+          ),
+        ).rejects.toThrow(BadRequestException);
+
+        expect(answerRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('rejects duplicate questionId in same submission → 400', async () => {
+        const { service, answerRepo, paperQuestionRepo } = setupSubmit(['q1']);
+
+        await expect(
+          service.submitAttempt(
+            attemptId,
+            [
+              { questionId: 'q1', selectedOptionId: 'opt-1' },
+              { questionId: 'q1', selectedOptionId: 'opt-2' },
+            ],
+            userId,
+          ),
+        ).rejects.toThrow(BadRequestException);
+
+        // Bail-fast: duplicate guard runs BEFORE the membership query
+        // so paperQuestionRepo.find should not even be hit.
+        expect(paperQuestionRepo.find).not.toHaveBeenCalled();
+        expect(answerRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('rejects unknown selectedOptionId → 400', async () => {
+        const { service, questionRepo, optionRepo, answerRepo } = setupSubmit([
+          'q1',
+        ]);
+        questionRepo.findOne.mockResolvedValue({
+          id: 'q1',
+          type: QuestionType.OBJECTIVE,
+        });
+        // Option does not exist in DB at all.
+        optionRepo.findOne.mockResolvedValue(null);
+
+        await expect(
+          service.submitAttempt(
+            attemptId,
+            [{ questionId: 'q1', selectedOptionId: 'opt-ghost' }],
+            userId,
+          ),
+        ).rejects.toThrow(BadRequestException);
+
+        expect(answerRepo.save).not.toHaveBeenCalled();
+      });
+
+      it('valid submission still grades correctly with all guards in place', async () => {
+        // Positive control: full happy path with paper-membership +
+        // option-belongs-to-question constraints satisfied.
+        const { service, questionRepo, optionRepo, attemptRepo } = setupSubmit([
+          'q1',
+          'q2',
+        ]);
+
+        questionRepo.findOne
+          .mockResolvedValueOnce({ id: 'q1', type: QuestionType.OBJECTIVE })
+          .mockResolvedValueOnce({ id: 'q2', type: QuestionType.OBJECTIVE });
+        optionRepo.findOne
+          .mockResolvedValueOnce({
+            id: 'opt-1',
+            question_id: 'q1',
+            is_correct: true,
+          })
+          .mockResolvedValueOnce({
+            id: 'opt-2',
+            question_id: 'q2',
+            is_correct: true,
+          });
+
+        await service.submitAttempt(
+          attemptId,
+          [
+            { questionId: 'q1', selectedOptionId: 'opt-1' },
+            { questionId: 'q2', selectedOptionId: 'opt-2' },
+          ],
+          userId,
+        );
+
+        const savedAttempt = attemptRepo.save.mock.calls[0][0];
+        expect(savedAttempt.score).toBe(100);
+        expect(savedAttempt.status).toBe(AttemptStatus.GRADED);
+      });
     });
   });
 
