@@ -478,6 +478,88 @@ describe('Security & Authorization', () => {
       });
     });
 
+    // ──────────────────────────────────────────────────────────────────
+    // GET /audit-logs query parameters — exercise the real HTTP path
+    // (controller → service → SQL) so the contract for filter +
+    // pagination is pinned end-to-end. The unit suite covers the
+    // service in isolation; this block adds boundary coverage at the
+    // request surface.
+    // ──────────────────────────────────────────────────────────────────
+    describe('GET /audit-logs query semantics', () => {
+      const ACTION = `audit_query_${U}`;
+      let actorId: string;
+
+      beforeAll(async () => {
+        const me = await request(server)
+          .get('/auth/me')
+          .set('Authorization', `Bearer ${adminToken}`);
+        actorId = me.body.id;
+        // Seed a small known set of rows tagged with the sentinel
+        // action so filter assertions are not polluted by unrelated
+        // background traffic from other tests in this suite.
+        for (let i = 0; i < 5; i++) {
+          await ds.query(
+            `INSERT INTO audit_logs (actor_id, action, detail)
+             VALUES ($1, $2, $3::jsonb)`,
+            [actorId, ACTION, JSON.stringify({ i })],
+          );
+        }
+      });
+
+      it('action filter returns only matching rows + paginated envelope', async () => {
+        const res = await request(server)
+          .get(`/audit-logs?action=${ACTION}&limit=10`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        expect(res.status).toBe(200);
+        expect(res.body).toHaveProperty('data');
+        expect(res.body).toHaveProperty('total');
+        expect(res.body).toHaveProperty('page', 1);
+        expect(res.body).toHaveProperty('limit', 10);
+        expect(Array.isArray(res.body.data)).toBe(true);
+        expect(res.body.total).toBeGreaterThanOrEqual(5);
+        for (const row of res.body.data) {
+          expect(row.action).toBe(ACTION);
+        }
+      });
+
+      it('limit + page slice the result deterministically (DESC by created_at)', async () => {
+        const p1 = await request(server)
+          .get(`/audit-logs?action=${ACTION}&limit=2&page=1`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        const p2 = await request(server)
+          .get(`/audit-logs?action=${ACTION}&limit=2&page=2`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        expect(p1.status).toBe(200);
+        expect(p2.status).toBe(200);
+        expect(p1.body.data.length).toBeLessThanOrEqual(2);
+        expect(p2.body.data.length).toBeLessThanOrEqual(2);
+        // Pages must not overlap on the same filter scope.
+        const p1ids = new Set(p1.body.data.map((r: any) => r.id));
+        for (const r of p2.body.data) {
+          expect(p1ids.has(r.id)).toBe(false);
+        }
+      });
+
+      it('actorId + future "to" date returns the seeded rows; far-past "to" returns none', async () => {
+        // 1) Future ceiling — should include our seed rows.
+        const future = '2099-01-01';
+        const inWindow = await request(server)
+          .get(`/audit-logs?action=${ACTION}&actorId=${actorId}&to=${future}&limit=100`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        expect(inWindow.status).toBe(200);
+        expect(inWindow.body.total).toBeGreaterThanOrEqual(5);
+
+        // 2) Far-past ceiling — must exclude every recently-seeded row.
+        const past = '2000-01-01';
+        const outOfWindow = await request(server)
+          .get(`/audit-logs?action=${ACTION}&actorId=${actorId}&to=${past}&limit=100`)
+          .set('Authorization', `Bearer ${adminToken}`);
+        expect(outOfWindow.status).toBe(200);
+        expect(outOfWindow.body.total).toBe(0);
+        expect(outOfWindow.body.data).toEqual([]);
+      });
+    });
+
     it('audit CSV export masks sensitive fields', async () => {
       // Create a log with sensitive detail
       await ds.query(

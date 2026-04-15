@@ -146,4 +146,29 @@ describe('EncryptionService', () => {
     const encrypted = service.encrypt(plaintext);
     expect(service.decrypt(encrypted)).toBe(plaintext);
   });
+
+  // Format-validation guard inside decrypt: any payload that does not
+  // split into exactly 3 colon-separated segments is rejected with the
+  // documented "Invalid encrypted format" error before any crypto
+  // primitives are touched. This pins the parser contract so a future
+  // refactor can't silently accept malformed input.
+  it('decrypt rejects payloads with fewer than 3 colon-separated parts', () => {
+    expect(() => service.decrypt('only-one-part')).toThrow(/Invalid encrypted format/);
+    expect(() => service.decrypt('only:two-parts')).toThrow(/Invalid encrypted format/);
+    expect(() => service.decrypt(':')).toThrow(/Invalid encrypted format/);
+  });
+
+  // Authentication-tag tamper: flipping bits in the 12-byte AES-GCM
+  // auth tag must surface as a verification error, not silently
+  // produce garbage plaintext. This is the tamper-evidence guarantee
+  // the audit/encryption posture relies on.
+  it('decrypt throws when only the auth tag is tampered (GCM verifies)', () => {
+    const encrypted = service.encrypt('audit-protected');
+    const parts = encrypted.split(':');
+    // Flip the leading byte of the tag (after base64 decode).
+    const tag = Buffer.from(parts[1], 'base64');
+    tag[0] = tag[0] ^ 0xff;
+    parts[1] = tag.toString('base64');
+    expect(() => service.decrypt(parts.join(':'))).toThrow();
+  });
 });

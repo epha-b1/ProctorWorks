@@ -23,17 +23,26 @@ module.exports = {
   ],
   coverageDirectory: './coverage',
   coverageReporters: ['text', 'text-summary', 'lcov', 'json-summary'],
-  // Enforced coverage gate. If any metric drops below its floor `jest
-  // --coverage` exits non-zero, failing `npm run test:cov` and therefore
-  // `run_tests.sh`. Floors are pinned from the current baseline so the
-  // gate only goes up over time; new contributions that dip below the
-  // floor block the build.
+  // Enforced coverage gate. Floors are pinned from the current
+  // demonstrated-achievable baseline so the gate only goes UP over
+  // time; any contribution that drops below these floors fails the
+  // build.
+  //
+  // These are intentionally NOT 100/100/100/100. Reaching true 100%
+  // across the ~925 branches in this service surface would require
+  // targeted unit tests for every defensive fallback (driver-error
+  // wrappers, stale-cache branches, scheduler cron guards, etc.) —
+  // many of which are unreachable without contrived mock graphs that
+  // test nothing real. The project's "no shallow assert-true tests"
+  // quality bar and the "minimal harmful distortion" rule outrank a
+  // cosmetic 100%. See README "Coverage gate" for the next tranche
+  // of work needed to push further.
   coverageThreshold: {
     global: {
-      statements: 80,
-      branches: 70,
-      functions: 80,
-      lines: 80,
+      statements: 91,
+      branches: 77,
+      functions: 95,
+      lines: 93,
     },
   },
   testEnvironment: 'node',
