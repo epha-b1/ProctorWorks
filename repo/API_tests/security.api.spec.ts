@@ -363,6 +363,121 @@ describe('Security & Authorization', () => {
       }
     });
 
+    // ──────────────────────────────────────────────────────────────────
+    // Strengthened append-only guarantees for `audit_logs`.
+    //
+    // The pre-existing two specs above prove that DB trigger raises on
+    // a blind DELETE / UPDATE. That is necessary but not sufficient:
+    //
+    //   - A silent trigger that raises AFTER the row was modified would
+    //     still be visible as "error thrown" from the caller's POV.
+    //   - A trigger that only fires on unqualified DELETEs would pass
+    //     the blind test but fail a targeted DELETE.
+    //
+    // The block below locks down the real contract: row content and
+    // row count are unchanged by targeted mutation attempts, and the
+    // immutability signal is surfaced in the DB error.
+    // ──────────────────────────────────────────────────────────────────
+    describe('audit_logs append-only trigger (targeted proof)', () => {
+      const ACTION_SENTINEL = `audit_immut_${U}`;
+      let targetId: string;
+
+      beforeAll(async () => {
+        // Insert one known row we can reason about by id. The DB
+        // trigger policy allows INSERTs (only UPDATE/DELETE fire the
+        // immutability function).
+        const [row] = await ds.query(
+          `INSERT INTO audit_logs (actor_id, action, detail)
+           VALUES (NULL, $1, '{"kind":"baseline"}'::jsonb)
+           RETURNING id, action, detail`,
+          [ACTION_SENTINEL],
+        );
+        targetId = row.id;
+      });
+
+      it('targeted DELETE WHERE id = <known row> is rejected and the row survives', async () => {
+        const before = await ds.query(
+          `SELECT COUNT(*)::int AS n FROM audit_logs`,
+        );
+        const baseline = before[0].n;
+
+        let captured: any = null;
+        try {
+          await ds.query(
+            `DELETE FROM audit_logs WHERE id = $1`,
+            [targetId],
+          );
+        } catch (e) {
+          captured = e;
+        }
+        expect(captured).not.toBeNull();
+        // Resilient but meaningful — match the immutability signal the
+        // project's trigger function raises, not the full verbatim.
+        expect(String(captured.message)).toMatch(/immutable/i);
+
+        const [still] = await ds.query(
+          `SELECT id, action FROM audit_logs WHERE id = $1`,
+          [targetId],
+        );
+        expect(still).toBeDefined();
+        expect(still.action).toBe(ACTION_SENTINEL);
+
+        const after = await ds.query(
+          `SELECT COUNT(*)::int AS n FROM audit_logs`,
+        );
+        expect(after[0].n).toBe(baseline);
+      });
+
+      it('targeted UPDATE SET action, detail WHERE id = <known row> is rejected and the row content is unchanged', async () => {
+        let captured: any = null;
+        try {
+          await ds.query(
+            `UPDATE audit_logs
+               SET action = 'tampered', detail = '{"kind":"tampered"}'::jsonb
+             WHERE id = $1`,
+            [targetId],
+          );
+        } catch (e) {
+          captured = e;
+        }
+        expect(captured).not.toBeNull();
+        expect(String(captured.message)).toMatch(/immutable/i);
+
+        const [still] = await ds.query(
+          `SELECT action, detail FROM audit_logs WHERE id = $1`,
+          [targetId],
+        );
+        expect(still.action).toBe(ACTION_SENTINEL);
+        // jsonb round-trips as an object from node-postgres.
+        expect(still.detail).toEqual({ kind: 'baseline' });
+      });
+
+      it('unqualified DELETE FROM audit_logs is rejected and the table is NOT emptied', async () => {
+        // The prior blind-DELETE test deleted WHERE id IN (SELECT ...
+        // LIMIT 1). This one probes the true blast-radius case: an
+        // unqualified DELETE must also surface the trigger.
+        const before = await ds.query(
+          `SELECT COUNT(*)::int AS n FROM audit_logs`,
+        );
+        const baseline = before[0].n;
+        expect(baseline).toBeGreaterThan(0);
+
+        let captured: any = null;
+        try {
+          await ds.query(`DELETE FROM audit_logs`);
+        } catch (e) {
+          captured = e;
+        }
+        expect(captured).not.toBeNull();
+        expect(String(captured.message)).toMatch(/immutable/i);
+
+        const after = await ds.query(
+          `SELECT COUNT(*)::int AS n FROM audit_logs`,
+        );
+        expect(after[0].n).toBe(baseline);
+      });
+    });
+
     it('audit CSV export masks sensitive fields', async () => {
       // Create a log with sensitive detail
       await ds.query(

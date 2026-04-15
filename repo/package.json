@@ -11,8 +11,9 @@
     "test:unit": "jest --testPathPatterns=unit_tests --verbose",
     "test:api:preflight": "node scripts/check-test-db.js",
     "test:api": "node scripts/check-test-db.js && jest --testPathPatterns=API_tests --verbose --runInBand",
-    "test:all": "node scripts/check-test-db.js && jest --testPathPatterns='unit_tests|API_tests' --verbose --runInBand",
-    "test:cov": "node scripts/check-test-db.js && jest --testPathPatterns='unit_tests|API_tests' --verbose --runInBand --coverage",
+    "test:e2e": "jest --testPathPatterns=e2e_tests --verbose --runInBand",
+    "test:all": "node scripts/check-test-db.js && jest --testPathPatterns='unit_tests|API_tests|e2e_tests' --verbose --runInBand",
+    "test:cov": "node scripts/check-test-db.js && jest --testPathPatterns='unit_tests|API_tests|e2e_tests' --verbose --runInBand --coverage",
     "migration:run": "npx ts-node ./node_modules/typeorm/cli.js migration:run -d src/database/typeorm.config.ts",
     "migration:revert": "npx ts-node ./node_modules/typeorm/cli.js migration:revert -d src/database/typeorm.config.ts",
     "migration:generate": "npx ts-node ./node_modules/typeorm/cli.js migration:generate -d src/database/typeorm.config.ts"

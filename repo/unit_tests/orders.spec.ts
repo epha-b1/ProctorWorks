@@ -511,6 +511,421 @@ describe('OrdersService', () => {
         expect(dataSource.transaction).not.toHaveBeenCalled();
       });
 
+      // ─────────────────────────────────────────────────────────────────
+      // Race-safety — concurrent duplicate requests must NOT 500.
+      //
+      // The scoped idempotency INSERT is the only unique constraint
+      // this path can collide on. Pre-fix, the service returned the
+      // raw pg `QueryFailedError` (SQLSTATE 23505), which the global
+      // exception filter converted to a 500. Post-fix, the service
+      // catches the unique violation, rolls the loser's transaction
+      // back, and resolves through the same scoped-replay lookup the
+      // happy-path pre-check uses — so the second call observes the
+      // winner's order with `alreadyExisted: true`, same as if it had
+      // arrived strictly after the winner committed.
+      //
+      // This test proves that contract without a real DB: the
+      // transaction mock fires a synthetic 23505, and the second
+      // idempotencyRepo.findOne — representing the winner's committed
+      // row — serves the resolved order through the replay path.
+      // ─────────────────────────────────────────────────────────────────
+      describe('race-safety: concurrent idempotent duplicates', () => {
+        it('unique-violation on idempotency INSERT resolves via scoped replay, not 500', async () => {
+          // Pre-check miss: no existing row at first.
+          const winningOrder = buildOrder({
+            id: 'winner-order',
+            store_id: 'store-1',
+            user_id: 'user-1',
+          });
+          idempotencyRepo.findOne
+            .mockResolvedValueOnce(null) // pre-check (our caller)
+            .mockResolvedValueOnce({
+              // post-conflict replay: the winner has committed.
+              id: 'idem-row-id',
+              operation_type: 'create_order',
+              actor_id: 'user-1',
+              store_id: 'store-1',
+              key: 'race-key',
+              response_body: { orderId: 'winner-order' },
+            });
+          orderRepo.findOne.mockResolvedValue(winningOrder);
+
+          const skuA = makeSkuInStore('sku-a', 500, null, 'store-1');
+          stubSkuQuery([skuA]);
+
+          // Transaction throws a synthetic pg-style unique violation
+          // from the idempotency INSERT. Everything inside the
+          // transaction has therefore rolled back.
+          const pgUniqueViolation: any = new Error(
+            'duplicate key value violates unique constraint "UQ_idempotency_keys_scoped"',
+          );
+          pgUniqueViolation.code = '23505';
+          pgUniqueViolation.constraint = 'UQ_idempotency_keys_scoped';
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw pgUniqueViolation;
+          });
+
+          const result = await service.createOrder(
+            {
+              idempotencyKey: 'race-key',
+              items: [{ skuId: 'sku-a', quantity: 1 }],
+            },
+            storeAdminUser,
+          );
+
+          // The loser returns the WINNER's order as a dedup — not 500.
+          expect(result.alreadyExisted).toBe(true);
+          expect(result.order).toBe(winningOrder);
+          // Replay went through the scoped lookup, not a raw-key path.
+          expect(idempotencyRepo.findOne).toHaveBeenNthCalledWith(2, {
+            where: {
+              operation_type: 'create_order',
+              actor_id: 'user-1',
+              store_id: 'store-1',
+              key: 'race-key',
+            },
+          });
+          // Order resolved via id (from response_body), not raw key.
+          expect(orderRepo.findOne).toHaveBeenCalledWith({
+            where: { id: 'winner-order' },
+            relations: ['items'],
+          });
+        });
+
+        it('unique-violation on driverError.code path (typeorm wrapping) still resolves to replay', async () => {
+          // Older / wrapped typeorm versions surface the SQLSTATE on
+          // `err.driverError.code` rather than `err.code`. The guard
+          // must accept both so upgrades do not silently regress the
+          // 500→replay behaviour.
+          idempotencyRepo.findOne
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce({
+              id: 'idem-row-id',
+              operation_type: 'create_order',
+              actor_id: 'user-1',
+              store_id: 'store-1',
+              key: 'race-key-wrapped',
+              response_body: { orderId: 'winner-order-2' },
+            });
+          orderRepo.findOne.mockResolvedValue(
+            buildOrder({
+              id: 'winner-order-2',
+              store_id: 'store-1',
+              user_id: 'user-1',
+            }),
+          );
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const wrapped: any = new Error('QueryFailedError');
+          wrapped.driverError = {
+            code: '23505',
+            constraint: 'UQ_idempotency_keys_scoped',
+          };
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw wrapped;
+          });
+
+          const result = await service.createOrder(
+            {
+              idempotencyKey: 'race-key-wrapped',
+              items: [{ skuId: 'sku-a', quantity: 1 }],
+            },
+            storeAdminUser,
+          );
+          expect(result.alreadyExisted).toBe(true);
+          expect(result.order.id).toBe('winner-order-2');
+        });
+
+        it('non-idempotency unique violation is NOT swallowed — propagates as-is', async () => {
+          // A future migration could introduce a different UNIQUE
+          // constraint on some column we insert into inside the
+          // transaction. Our catch MUST only handle the scoped
+          // idempotency index; anything else is a real bug and must
+          // surface, not get silently converted to a phantom replay.
+          idempotencyRepo.findOne.mockResolvedValueOnce(null);
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const someOtherViolation: any = new Error(
+            'duplicate key value violates unique constraint "UQ_some_other_thing"',
+          );
+          someOtherViolation.code = '23505';
+          someOtherViolation.constraint = 'UQ_some_other_thing';
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw someOtherViolation;
+          });
+
+          await expect(
+            service.createOrder(
+              {
+                idempotencyKey: 'unrelated-key',
+                items: [{ skuId: 'sku-a', quantity: 1 }],
+              },
+              storeAdminUser,
+            ),
+          ).rejects.toThrow(/UQ_some_other_thing/);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // Hardening: the allowlist is EXACT NAMES, not a substring
+        // regex. A future unrelated constraint whose name happens to
+        // contain the substring "idempotency" must NOT be silently
+        // classified as a replay. Prior implementation used
+        // /idempotency/i and would have treated this as a replay —
+        // this test is the regression guard.
+        // ─────────────────────────────────────────────────────────────
+        it('23505 on a DIFFERENT constraint whose name contains "idempotency" still propagates', async () => {
+          idempotencyRepo.findOne.mockResolvedValueOnce(null);
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const lookalike: any = new Error(
+            'duplicate key value violates unique constraint "UQ_future_idempotency_thing"',
+          );
+          lookalike.code = '23505';
+          // Contains "idempotency" but is NOT in the exact allowlist.
+          // A regex substring match would have mis-classified this as
+          // a replay; the hardened guard must reject it.
+          lookalike.constraint = 'UQ_future_idempotency_thing';
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw lookalike;
+          });
+
+          await expect(
+            service.createOrder(
+              {
+                idempotencyKey: 'lookalike-key',
+                items: [{ skuId: 'sku-a', quantity: 1 }],
+              },
+              storeAdminUser,
+            ),
+          ).rejects.toThrow(/UQ_future_idempotency_thing/);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // Hardening: constraint field absent is treated as UNKNOWN,
+        // not silently accepted as idempotency. Prior implementation
+        // returned `true` in this branch on the assumption it was the
+        // only unique index reachable; the hardened guard fails
+        // closed and propagates so nothing unknown is silently
+        // replayed.
+        // ─────────────────────────────────────────────────────────────
+        it('23505 with NO constraint field propagates (fails closed)', async () => {
+          idempotencyRepo.findOne.mockResolvedValueOnce(null);
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const bareViolation: any = new Error(
+            'duplicate key (no constraint name in driver output)',
+          );
+          bareViolation.code = '23505';
+          // No .constraint — older driver path.
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw bareViolation;
+          });
+
+          await expect(
+            service.createOrder(
+              {
+                idempotencyKey: 'bare-key',
+                items: [{ skuId: 'sku-a', quantity: 1 }],
+              },
+              storeAdminUser,
+            ),
+          ).rejects.toThrow(/no constraint name/);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // Hardening: nested wrapper shapes (driverError, originalError,
+        // cause) are walked robustly. Some pooled-connection paths
+        // nest the pg fields one or two levels deeper than
+        // QueryFailedError's top-level .driverError.
+        // ─────────────────────────────────────────────────────────────
+        it('recognises pg fields when nested under driverError.originalError (deep wrapper)', async () => {
+          const winningOrder = buildOrder({
+            id: 'nested-winner',
+            store_id: 'store-1',
+            user_id: 'user-1',
+          });
+          idempotencyRepo.findOne
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce({
+              id: 'idem-row-id',
+              operation_type: 'create_order',
+              actor_id: 'user-1',
+              store_id: 'store-1',
+              key: 'nested-key',
+              response_body: { orderId: 'nested-winner' },
+            });
+          orderRepo.findOne.mockResolvedValue(winningOrder);
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const nested: any = new Error('QueryFailedError');
+          nested.driverError = {
+            // Outer driverError carries neither the code nor the
+            // constraint — the real pg error is one more level deep
+            // on `.originalError`. The extractor must walk down.
+            originalError: {
+              code: '23505',
+              constraint: 'UQ_idempotency_keys_scoped',
+            },
+          };
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw nested;
+          });
+
+          const result = await service.createOrder(
+            {
+              idempotencyKey: 'nested-key',
+              items: [{ skuId: 'sku-a', quantity: 1 }],
+            },
+            storeAdminUser,
+          );
+          expect(result.alreadyExisted).toBe(true);
+          expect(result.order.id).toBe('nested-winner');
+        });
+
+        it('recognises pg fields when nested under cause (alternative wrapper)', async () => {
+          idempotencyRepo.findOne
+            .mockResolvedValueOnce(null)
+            .mockResolvedValueOnce({
+              id: 'idem-row-id',
+              operation_type: 'create_order',
+              actor_id: 'user-1',
+              store_id: 'store-1',
+              key: 'cause-key',
+              response_body: { orderId: 'cause-winner' },
+            });
+          orderRepo.findOne.mockResolvedValue(
+            buildOrder({
+              id: 'cause-winner',
+              store_id: 'store-1',
+              user_id: 'user-1',
+            }),
+          );
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const causeWrapped: any = new Error('wrapped');
+          causeWrapped.cause = {
+            code: '23505',
+            constraint: 'UQ_idempotency_keys_scoped',
+          };
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw causeWrapped;
+          });
+
+          const result = await service.createOrder(
+            {
+              idempotencyKey: 'cause-key',
+              items: [{ skuId: 'sku-a', quantity: 1 }],
+            },
+            storeAdminUser,
+          );
+          expect(result.alreadyExisted).toBe(true);
+        });
+
+        // ─────────────────────────────────────────────────────────────
+        // Bounded retry: the first replay attempt misses (tiny
+        // read-after-write window), the second attempt succeeds. This
+        // is the hardening that closes the prior 409-on-visibility-gap
+        // risk for the common case.
+        // ─────────────────────────────────────────────────────────────
+        it('bounded retry: replay succeeds on the SECOND attempt → returns winner, not 409', async () => {
+          const winningOrder = buildOrder({
+            id: 'retry-winner',
+            store_id: 'store-1',
+            user_id: 'user-1',
+          });
+          idempotencyRepo.findOne
+            .mockResolvedValueOnce(null) // pre-check
+            .mockResolvedValueOnce(null) // retry attempt 1 — still invisible
+            .mockResolvedValueOnce({
+              // retry attempt 2 — now visible
+              id: 'idem-row-id',
+              operation_type: 'create_order',
+              actor_id: 'user-1',
+              store_id: 'store-1',
+              key: 'retry-key',
+              response_body: { orderId: 'retry-winner' },
+            });
+          orderRepo.findOne.mockResolvedValue(winningOrder);
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const pgUniqueViolation: any = new Error('dup');
+          pgUniqueViolation.code = '23505';
+          pgUniqueViolation.constraint = 'UQ_idempotency_keys_scoped';
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw pgUniqueViolation;
+          });
+
+          const result = await service.createOrder(
+            {
+              idempotencyKey: 'retry-key',
+              items: [{ skuId: 'sku-a', quantity: 1 }],
+            },
+            storeAdminUser,
+          );
+
+          expect(result.alreadyExisted).toBe(true);
+          expect(result.order.id).toBe('retry-winner');
+          // Exactly three findOne calls: pre-check + two retry attempts.
+          expect(idempotencyRepo.findOne).toHaveBeenCalledTimes(3);
+        });
+
+        it('bounded retry: BOTH attempts miss → ConflictException (not 500)', async () => {
+          // Extreme pathological case: the winner's row is not
+          // visible even after the bounded retry. We must NOT leak a
+          // 500 — we surface a retry-safe 409 so clients hit the same
+          // idempotency key again and observe the now-committed
+          // winner at the application layer.
+          idempotencyRepo.findOne
+            .mockResolvedValueOnce(null) // pre-check
+            .mockResolvedValueOnce(null) // retry 1
+            .mockResolvedValueOnce(null); // retry 2
+          stubSkuQuery([makeSkuInStore('sku-a', 500, null, 'store-1')]);
+
+          const pgUniqueViolation: any = new Error('dup key');
+          pgUniqueViolation.code = '23505';
+          pgUniqueViolation.constraint = 'UQ_idempotency_keys_scoped';
+          dataSource.transaction.mockImplementationOnce(async () => {
+            throw pgUniqueViolation;
+          });
+
+          await expect(
+            service.createOrder(
+              {
+                idempotencyKey: 'race-invisible',
+                items: [{ skuId: 'sku-a', quantity: 1 }],
+              },
+              storeAdminUser,
+            ),
+          ).rejects.toThrow(ConflictException);
+        });
+
+        it('replayBackoff returns immediately under NODE_ENV=test', async () => {
+          // Direct unit contract for the backoff short-circuit. The
+          // retry unit tests above prove the END-TO-END flow resolves
+          // without hanging; this test pins the local property that
+          // enables it so a refactor that accidentally removes the
+          // NODE_ENV guard shows up here, not as a slow unit suite.
+          const prior = process.env.NODE_ENV;
+          process.env.NODE_ENV = 'test';
+          try {
+            const before = Date.now();
+            // Backoff is protected but reachable from this file via
+            // the subclass of a service instance; reuse the local
+            // `service` and invoke via bracket access to keep the
+            // test free of "any" casts elsewhere.
+            await (service as any).replayBackoff(0);
+            await (service as any).replayBackoff(1);
+            const elapsed = Date.now() - before;
+            // Zero-wait should finish well inside 50ms even under
+            // heavy CI load. If this ever flakes, the NODE_ENV
+            // short-circuit is no longer active.
+            expect(elapsed).toBeLessThan(50);
+          } finally {
+            process.env.NODE_ENV = prior;
+          }
+        });
+      });
+
       it('platform_admin: cross-store SKU is allowed (existing behaviour preserved)', async () => {
         // platform_admin retains the cross-store admin capability.
         // This is the regression guard that proves the tightening is

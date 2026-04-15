@@ -35,6 +35,10 @@ echo ""
 
 DB_URL="postgres://proctorworks:proctorworks@db:5432/proctorworks"
 HEALTH_URL="http://localhost:3000/health"
+# Black-box E2E suite hits the running API over HTTP. Because jest runs
+# inside the `api` container via `docker compose exec`, `localhost:3000`
+# is the container's own listener and no port forwarding is required.
+E2E_BASE_URL="${E2E_BASE_URL:-http://localhost:3000}"
 MAX_WAIT=60
 RESET_ATTEMPTED=0
 
@@ -139,7 +143,7 @@ wait_for_health() {
 # ── Run tests ──────────────────────────────────────────────────────────────────
 
 run_unit_tests() {
-  echo "[3/4] Running unit tests..."
+  echo "[3/5] Running unit tests..."
   echo "----------------------------------------"
   # Capture jest's real exit code BEFORE the trailing echo. The
   # previous version did `... 2>&1; echo ""` which made `echo`'s
@@ -151,12 +155,45 @@ run_unit_tests() {
 }
 
 run_api_tests() {
-  echo "[4/4] Running API integration tests..."
+  echo "[4/5] Running API integration tests..."
   echo "----------------------------------------"
   local rc=0
   docker compose exec -T \
     -e DATABASE_URL="$DB_URL" \
     api sh -c "npx jest --testPathPatterns=API_tests --verbose --no-cache --runInBand" 2>&1 || rc=$?
+  echo ""
+  return "$rc"
+}
+
+# Black-box E2E suite. Runs INSIDE the api container so it hits the
+# real HTTP listener (no in-process AppModule bootstrap) and goes
+# through every middleware, guard, interceptor, and exception filter
+# exactly as production traffic would. E2E_BASE_URL is exported so the
+# supertest helper resolves against the live listener rather than the
+# default dev URL.
+run_e2e_tests() {
+  echo "[5/5] Running black-box E2E tests (HTTP against running API)..."
+  echo "----------------------------------------"
+  local rc=0
+  docker compose exec -T \
+    -e E2E_BASE_URL="$E2E_BASE_URL" \
+    api sh -c "npx jest --testPathPatterns=e2e_tests --verbose --no-cache --runInBand" 2>&1 || rc=$?
+  echo ""
+  return "$rc"
+}
+
+# Coverage gate. Runs the full combined suite with --coverage, which
+# makes Jest enforce `coverageThreshold` in jest.config.js. Failing
+# coverage floors surface as a non-zero jest exit, which this function
+# passes through just like the suites above.
+run_coverage_gate() {
+  echo "[coverage] Enforcing global coverage threshold..."
+  echo "----------------------------------------"
+  local rc=0
+  docker compose exec -T \
+    -e DATABASE_URL="$DB_URL" \
+    -e E2E_BASE_URL="$E2E_BASE_URL" \
+    api sh -c "npx jest --testPathPatterns='unit_tests|API_tests|e2e_tests' --runInBand --coverage --coverageReporters=text-summary" 2>&1 || rc=$?
   echo ""
   return "$rc"
 }
@@ -168,33 +205,54 @@ wait_for_health
 
 UNIT_EXIT=0
 API_EXIT=0
+E2E_EXIT=0
+COV_EXIT=0
 
 # `set -e` exempts the LHS of `||`, so the `|| VAR=$?` capture works
-# without triggering an early exit. Each function now returns the
-# actual jest exit code (see run_unit_tests / run_api_tests above).
+# without triggering an early exit. Each function returns the actual
+# jest exit code.
 run_unit_tests || UNIT_EXIT=$?
 run_api_tests  || API_EXIT=$?
+run_e2e_tests  || E2E_EXIT=$?
+
+# Only attempt the coverage gate if the three test suites themselves
+# passed. If any suite failed we already know the build is broken and
+# re-running jest a fourth time just to watch it fail again wastes CI
+# time. Skip with SKIP_COVERAGE=1 for local iteration.
+if [ "${SKIP_COVERAGE:-0}" = "1" ]; then
+  echo "[coverage] SKIP_COVERAGE=1 — skipping coverage gate"
+elif [ "$UNIT_EXIT" -eq 0 ] && [ "$API_EXIT" -eq 0 ] && [ "$E2E_EXIT" -eq 0 ]; then
+  run_coverage_gate || COV_EXIT=$?
+else
+  echo "[coverage] Skipped — earlier suite failed; fix that first"
+fi
 
 echo "========================================"
-if [ "$UNIT_EXIT" -eq 0 ] && [ "$API_EXIT" -eq 0 ]; then
+if [ "$UNIT_EXIT" -eq 0 ] && [ "$API_EXIT" -eq 0 ] && [ "$E2E_EXIT" -eq 0 ] && [ "$COV_EXIT" -eq 0 ]; then
   echo "  === ALL TESTS PASSED ==="
 else
   # `if`/`then` form (not `[ ] && echo ...`) so a 0-state branch
   # doesn't propagate a non-zero RHS exit and trip `set -e`.
   if [ "$UNIT_EXIT" -ne 0 ]; then
-    echo "  Unit tests:  FAILED (exit $UNIT_EXIT)"
+    echo "  Unit tests:     FAILED (exit $UNIT_EXIT)"
   fi
   if [ "$API_EXIT" -ne 0 ]; then
-    echo "  API tests:   FAILED (exit $API_EXIT)"
+    echo "  API tests:      FAILED (exit $API_EXIT)"
+  fi
+  if [ "$E2E_EXIT" -ne 0 ]; then
+    echo "  E2E tests:      FAILED (exit $E2E_EXIT)"
+  fi
+  if [ "$COV_EXIT" -ne 0 ]; then
+    echo "  Coverage gate:  FAILED (exit $COV_EXIT)"
   fi
   echo "  === SOME TESTS FAILED ==="
 fi
 echo "========================================"
 
-# Saturating combine: any non-zero suite → exit 1. Avoids the
-# pathological `exit $((U+A))` case where two exit codes happen to
+# Saturating combine: any non-zero phase → exit 1. Avoids the
+# pathological `exit $((U+A+E+C))` case where exit codes happen to
 # sum to a multiple of 256 and POSIX wraps the wrapper exit to 0.
-if [ "$UNIT_EXIT" -ne 0 ] || [ "$API_EXIT" -ne 0 ]; then
+if [ "$UNIT_EXIT" -ne 0 ] || [ "$API_EXIT" -ne 0 ] || [ "$E2E_EXIT" -ne 0 ] || [ "$COV_EXIT" -ne 0 ]; then
   exit 1
 fi
 exit 0

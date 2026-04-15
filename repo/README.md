@@ -50,13 +50,47 @@ npm run test:api -- --runInBand
 ## Run Tests
 
 ```bash
-# Docker (recommended — fully self-contained)
+# Docker (recommended — fully self-contained, runs every suite + coverage gate)
 ./run_tests.sh
 
 # Local
 npm run test:unit -- --runInBand
-npm run test:api -- --runInBand
+npm run test:api  -- --runInBand
+npm run test:e2e  -- --runInBand   # requires the API to be running at E2E_BASE_URL
+npm run test:cov  -- --runInBand   # enforces the coverage gate
 ```
+
+### Suites and what they guard
+
+| Folder        | Type                           | Bootstraps Nest in-process? | Hits HTTP?                | Primary contract                              |
+|---------------|--------------------------------|-----------------------------|----------------------------|-----------------------------------------------|
+| `unit_tests/` | Unit (services, pipes, guards) | n/a                         | No                         | Pure logic, branch coverage                    |
+| `API_tests/`  | API integration (supertest)    | Yes (per-suite `AppModule`) | In-process via supertest   | Controller ↔ service ↔ DB contract, strict status codes, payload invariants |
+| `e2e_tests/`  | Black-box E2E (supertest → URL) | **No** — boots against running container | Yes, real network        | Full request pipeline: compression → guard → interceptor → filter → DB, including audit-log side effects |
+
+The E2E suite deliberately does not import `AppModule`. It hits
+`E2E_BASE_URL` (default `http://localhost:3000`) over real HTTP so the
+container boundary is exercised exactly as production traffic would be.
+`run_tests.sh` exports `E2E_BASE_URL` into the `api` container and runs
+jest there, so the URL resolves to the container's own listener and no
+host port forwarding is required.
+
+### Coverage gate
+
+`jest.config.js` enforces a global `coverageThreshold`:
+
+- statements ≥ 80%, lines ≥ 80%, functions ≥ 80%, branches ≥ 70%
+
+The gate runs as the final step in `run_tests.sh` (after unit + API +
+E2E) and as `npm run test:cov` locally. A drop below any floor fails
+the build with a non-zero jest exit. Entity files, DTOs, `main.ts`,
+module wiring, and `src/database/**` are excluded from coverage since
+they are declarative glue with no meaningful branches.
+
+Skip with `SKIP_COVERAGE=1 ./run_tests.sh` during local iteration when
+the three test suites are green and you just want a fast rerun.
+
+### Preflight (API tests only)
 
 `npm run test:api` runs a fast Postgres handshake preflight
 (`scripts/check-test-db.js`) before invoking Jest. If the test DB is

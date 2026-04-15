@@ -131,7 +131,19 @@ export class PromotionsService {
       const couponRepo = manager.getRepository(Coupon);
       const claimRepo = manager.getRepository(CouponClaim);
 
-      const coupon = await couponRepo.findOne({ where: { code } });
+      // Pessimistic row lock (SELECT ... FOR UPDATE) on the coupon row
+      // serializes concurrent claim transactions so the
+      // remaining_quantity decrement is free of the lost-update race.
+      // Without the lock, two parallel claims could both observe
+      // remaining_quantity=1, both insert a claim row, and both save
+      // remaining_quantity=0 — netting 2 claims against a cap of 1.
+      // The lock is scoped to this row only, so claims on *different*
+      // coupons still run in parallel and the hot-path latency for
+      // uncontested coupons is unchanged.
+      const coupon = await couponRepo.findOne({
+        where: { code },
+        lock: { mode: 'pessimistic_write' },
+      });
       if (!coupon) {
         throw new NotFoundException('Coupon not found');
       }

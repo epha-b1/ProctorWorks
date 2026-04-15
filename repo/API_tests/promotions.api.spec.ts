@@ -4,6 +4,7 @@ process.env.DATABASE_URL =
 
 import { Test } from '@nestjs/testing';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { DataSource } from 'typeorm';
 const request = require('supertest');
 import { AppModule } from '../src/app.module';
 
@@ -21,6 +22,7 @@ async function login(srv: any, u: string, p: string) {
 describe('Promotions & Coupons API', () => {
   let app: INestApplication;
   let server: any;
+  let ds: DataSource;
   let token: string;
   let promoId: string;
   let couponId: string;
@@ -32,6 +34,7 @@ describe('Promotions & Coupons API', () => {
     app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true, transformOptions: { enableImplicitConversion: true } }));
     await app.init();
     server = app.getHttpServer();
+    ds = mod.get(DataSource);
     token = await login(server, 'admin', 'Admin1234!');
   }, 30000);
 
@@ -48,12 +51,15 @@ describe('Promotions & Coupons API', () => {
     promoId = res.body.id;
   });
 
-  it('GET /promotions → 200', async () => {
+  it('GET /promotions → 200 with the created promotion', async () => {
     logStep('GET', '/promotions');
     const res = await request(server).get('/promotions').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/promotions', res.status);
-    expect([200, 201]).toContain(res.status);
-    expect(res.body.some((p: any) => p.id === promoId)).toBe(true);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
+    const found = res.body.find((p: any) => p.id === promoId);
+    expect(found).toBeDefined();
+    expect(found.priority).toBe(500);
   });
 
   it('POST /coupons → 201', async () => {
@@ -67,38 +73,47 @@ describe('Promotions & Coupons API', () => {
     couponId = res.body.id;
   });
 
-  it('GET /coupons → 200', async () => {
+  it('GET /coupons → 200 with the created coupon', async () => {
     logStep('GET', '/coupons');
     const res = await request(server).get('/coupons').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/coupons', res.status);
-    expect([200, 201]).toContain(res.status);
-    expect(res.body.some((c: any) => c.id === couponId)).toBe(true);
+    expect(res.status).toBe(200);
+    const found = res.body.find((c: any) => c.id === couponId);
+    expect(found).toBeDefined();
+    expect(found.remaining_quantity).toBe(3);
+    expect(found.code).toBe(couponCode);
   });
 
-  it('POST /coupons/:code/claim → 200, decrements quantity', async () => {
+  it('POST /coupons/:code/claim → 201, decrements quantity', async () => {
     logStep('POST', `/coupons/${couponCode}/claim`);
     const res = await request(server).post(`/coupons/${couponCode}/claim`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'claim', res.status);
-    expect([200, 201]).toContain(res.status);
+    // Default @Post → 201.
+    expect(res.status).toBe(201);
     expect(res.body.coupon_id).toBe(couponId);
-    // Check remaining
+    expect(res.body).toHaveProperty('user_id');
+
     const c = await request(server).get('/coupons').set('Authorization', `Bearer ${token}`);
     const coupon = c.body.find((x: any) => x.id === couponId);
     expect(coupon.remaining_quantity).toBe(2);
+    expect(coupon.status).toBe('active');
   });
 
-  it('POST /coupons/:code/claim again → 200', async () => {
+  it('POST /coupons/:code/claim again → 201', async () => {
     logStep('POST', `/coupons/${couponCode}/claim`);
     const res = await request(server).post(`/coupons/${couponCode}/claim`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'claim', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(201);
+    expect(res.body.coupon_id).toBe(couponId);
   });
 
-  it('POST /coupons/:id/expire → 200', async () => {
+  it('POST /coupons/:id/expire → 201, coupon status flips to expired', async () => {
     logStep('POST', `/coupons/${couponId}/expire`);
     const res = await request(server).post(`/coupons/${couponId}/expire`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'expire', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe(couponId);
+    expect(res.body.status).toBe('expired');
   });
 
   it('POST /coupons/:code/claim on expired → error', async () => {
@@ -118,7 +133,8 @@ describe('Promotions & Coupons API', () => {
     logStep('POST', `/coupons/${code2}/claim (last)`);
     const res = await request(server).post(`/coupons/${code2}/claim`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'claim', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(201);
+    expect(res.body).toHaveProperty('user_id');
 
     // Verify exhausted
     const list = await request(server).get('/coupons').set('Authorization', `Bearer ${token}`);
@@ -265,7 +281,7 @@ describe('Promotions & Coupons API', () => {
       const claimRes = await request(server)
         .post(`/coupons/${capCode}/claim`)
         .set('Authorization', `Bearer ${token}`);
-      expect([200, 201]).toContain(claimRes.status);
+      expect(claimRes.status).toBe(201);
 
       // Redeem #1 — should succeed (cap=1, count starts at 0).
       // Need a valid orderId — create a fake one via the orders API.
@@ -310,13 +326,13 @@ describe('Promotions & Coupons API', () => {
         .post(`/coupons/${capCode}/redeem`)
         .set('Authorization', `Bearer ${token}`)
         .send({ userId: adminUserId, orderId: order.body.id });
-      expect([200, 201]).toContain(redeem1.status);
+      expect(redeem1.status).toBe(201);
 
       // Second: claim again and try to redeem.
       const claimRes2 = await request(server)
         .post(`/coupons/${capCode}/claim`)
         .set('Authorization', `Bearer ${token}`);
-      expect([200, 201]).toContain(claimRes2.status);
+      expect(claimRes2.status).toBe(201);
 
       const order2 = await request(server)
         .post('/orders')
@@ -334,6 +350,102 @@ describe('Promotions & Coupons API', () => {
         .send({ userId: adminUserId, orderId: order2.body.id });
       expect(redeem2.status).toBe(400);
       expect(redeem2.body.message).toMatch(/cap/i);
+    });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Concurrency — coupon claim race.
+  //
+  // When a coupon's `remaining_quantity` is 1, N parallel claim
+  // attempts must resolve to exactly ONE successful claim. The
+  // failing attempts must surface as non-5xx (business-level errors:
+  // 400 exhausted / 404 scope-hidden / similar) and the `coupon_claims`
+  // table must carry exactly one row for that coupon.
+  //
+  // The service serializes concurrent claimCoupon transactions on the
+  // coupon row via SELECT ... FOR UPDATE; this test pins that contract
+  // end-to-end through the live HTTP + TypeORM + Postgres path. No
+  // transport mocking, no in-process shortcut.
+  // ──────────────────────────────────────────────────────────────────────
+  describe('Concurrency: coupon claim race when remaining_quantity = 1', () => {
+    it('parallel claims → exactly one success, no 5xx, no duplicate claim rows', async () => {
+      // Dedicated promotion + coupon so this block is insulated from
+      // the sibling tests' fixtures (and vice versa).
+      const racePromo = await request(server)
+        .post('/promotions')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          name: `RacePromo-${U}`,
+          type: 'percentage',
+          priority: 20,
+          discountType: 'percentage',
+          discountValue: 10,
+        });
+      expect(racePromo.status).toBe(201);
+
+      const raceCode = `RACE-${U}`;
+      const raceCoupon = await request(server)
+        .post('/coupons')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          code: raceCode,
+          promotionId: racePromo.body.id,
+          remainingQuantity: 1,
+        });
+      expect(raceCoupon.status).toBe(201);
+      expect(raceCoupon.body.remaining_quantity).toBe(1);
+      const raceCouponId = raceCoupon.body.id;
+
+      const parallel = 6;
+      const results = await Promise.all(
+        Array.from({ length: parallel }, () =>
+          request(server)
+            .post(`/coupons/${raceCode}/claim`)
+            .set('Authorization', `Bearer ${token}`),
+        ),
+      );
+
+      const statuses = results.map((r: any) => r.status);
+
+      // Primary contract: zero 5xx. A race that returns 500 would be
+      // the kind of bug this test is here to prevent.
+      const fiveHundreds = statuses.filter((s: number) => s >= 500);
+      expect(fiveHundreds).toEqual([]);
+
+      // Exactly one claim returns 201; the rest surface business-
+      // level errors (400 exhausted / similar) but NEVER 2xx.
+      const wins = results.filter((r: any) => r.status === 201);
+      const losses = results.filter((r: any) => r.status !== 201);
+      expect(wins).toHaveLength(1);
+      expect(losses).toHaveLength(parallel - 1);
+      for (const l of losses) {
+        expect(l.status).toBeGreaterThanOrEqual(400);
+        expect(l.status).toBeLessThan(500);
+      }
+
+      // The winning response carries a real claim row wired to our coupon.
+      const winner = wins[0] as any;
+      expect(winner.body.coupon_id).toBe(raceCouponId);
+      expect(typeof winner.body.user_id).toBe('string');
+
+      // State invariant: exactly one claim persisted for this coupon;
+      // the coupon is now exhausted and remaining_quantity is zero,
+      // never negative.
+      const claimCount = await ds.query(
+        `SELECT COUNT(*)::int AS n FROM coupon_claims WHERE coupon_id = $1`,
+        [raceCouponId],
+      );
+      expect(claimCount[0].n).toBe(1);
+
+      const list = await request(server)
+        .get('/coupons')
+        .set('Authorization', `Bearer ${token}`);
+      expect(list.status).toBe(200);
+      const persisted = list.body.find((c: any) => c.id === raceCouponId);
+      expect(persisted).toBeDefined();
+      expect(persisted.remaining_quantity).toBe(0);
+      expect(persisted.remaining_quantity).toBeGreaterThanOrEqual(0);
+      expect(persisted.status).toBe('exhausted');
     });
   });
 });

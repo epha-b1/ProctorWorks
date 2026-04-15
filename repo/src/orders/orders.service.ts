@@ -71,39 +71,12 @@ export class OrdersService {
     const callerStoreId =
       this.enforceStoreScope(user) || this.getUserStoreId(user);
 
-    const existingKey = await this.idempotencyRepo.findOne({
-      where: {
-        operation_type: 'create_order',
-        actor_id: user.id,
-        store_id: callerStoreId,
-        key: dto.idempotencyKey,
-      },
-    });
-    if (existingKey) {
-      const orderId: string | undefined = existingKey.response_body?.orderId;
-      if (orderId) {
-        const existingOrder = await this.orderRepo.findOne({
-          where: { id: orderId },
-          relations: ['items'],
-        });
-        // Defense-in-depth: even if the index isn't trusted (e.g. a
-        // legacy unscoped row was matched somehow), refuse to return
-        // an order that doesn't belong to this caller's store.
-        if (
-          existingOrder &&
-          (callerStoreId == null || existingOrder.store_id === callerStoreId) &&
-          existingOrder.user_id === user.id
-        ) {
-          return { order: existingOrder, alreadyExisted: true };
-        }
-      }
-      // Stored key with mismatched scope — refuse to leak. Treating
-      // this as NotFound is the safest choice: the caller can retry
-      // with a fresh key, and no foreign data is exposed.
-      throw new NotFoundException(
-        'Idempotency key exists but does not belong to this scope',
-      );
-    }
+    const preReplay = await this.replayScopedOrder(
+      dto.idempotencyKey,
+      user,
+      callerStoreId,
+    );
+    if (preReplay) return preReplay;
 
     // 2. Look up SKU prices, compute subtotal.
     //
@@ -192,51 +165,250 @@ export class OrdersService {
       ? this.encryptionService.encrypt(dto.internalNotes)
       : null;
 
-    // 4. Create order + items in transaction
-    return this.dataSource.transaction(async (manager) => {
-      const order = manager.create(Order, {
-        store_id: storeId,
-        user_id: user.id,
-        idempotency_key: dto.idempotencyKey,
-        total_cents: totalCents,
-        discount_cents: discountCents,
-        coupon_id: couponId,
-        promotion_id: promotionId,
-        internal_notes: encryptedNotes,
-        status: OrderStatus.PENDING,
+    // 4. Create order + items in transaction.
+    //
+    //    Race-safety note: the final INSERT into `idempotency_keys`
+    //    is backed by the composite UNIQUE index
+    //      UQ_idempotency_keys_scoped
+    //        = (operation_type, actor_id, COALESCE(store_id, sentinel), key)
+    //    installed by ScopeIdempotencyKeys1711900000003. If two
+    //    concurrent callers both miss the preReplay lookup above,
+    //    they will both enter this transaction. Only one INSERT
+    //    succeeds; the other raises SQLSTATE 23505 (unique_violation).
+    //    Pre-fix that surfaced as HTTP 500. Post-fix we catch the
+    //    23505, let the loser's order + items roll back with the
+    //    transaction, and resolve via the same scoped-replay helper
+    //    the happy-path pre-check uses — so the loser observes the
+    //    winner's order with `alreadyExisted: true`, exactly as if
+    //    it had arrived a beat later.
+    try {
+      return await this.dataSource.transaction(async (manager) => {
+        const order = manager.create(Order, {
+          store_id: storeId,
+          user_id: user.id,
+          idempotency_key: dto.idempotencyKey,
+          total_cents: totalCents,
+          discount_cents: discountCents,
+          coupon_id: couponId,
+          promotion_id: promotionId,
+          internal_notes: encryptedNotes,
+          status: OrderStatus.PENDING,
+        });
+        const savedOrder = await manager.save(order);
+
+        const items = itemEntries.map((entry) =>
+          manager.create(OrderItem, {
+            order_id: savedOrder.id,
+            sku_id: entry.skuId,
+            quantity: entry.quantity,
+            unit_price_cents: entry.unitPriceCents,
+          }),
+        );
+        await manager.save(items);
+
+        // 5. Store idempotency record — scoped by operation + actor + store
+        //    so different tenants can legitimately reuse the same key
+        //    without colliding on the lookup, and so the read-back path
+        //    can never serve a foreign tenant's order.
+        const idempotencyRecord = manager.create(IdempotencyKey, {
+          key: dto.idempotencyKey,
+          operation_type: 'create_order',
+          actor_id: user.id,
+          store_id: callerStoreId,
+          response_body: { orderId: savedOrder.id },
+        });
+        await manager.save(idempotencyRecord);
+
+        const fullOrder = await manager.findOne(Order, {
+          where: { id: savedOrder.id },
+          relations: ['items'],
+        });
+
+        return { order: fullOrder, alreadyExisted: false };
       });
-      const savedOrder = await manager.save(order);
+    } catch (err) {
+      if (this.isIdempotencyUniqueViolation(err)) {
+        // Concurrent caller won the race. Our transaction rolled
+        // back (no ghost order, no orphan items), so we can safely
+        // resolve through the deterministic replay path — which
+        // re-enforces the exact same (store_id, user_id) ownership
+        // guard as the pre-check. A small bounded retry absorbs the
+        // narrow read-after-write window where the winner's commit
+        // is not yet visible to our connection (same pool / brief
+        // replication-like lag); see replayScopedOrderWithRetry.
+        const replay = await this.replayScopedOrderWithRetry(
+          dto.idempotencyKey,
+          user,
+          callerStoreId,
+        );
+        if (replay) return replay;
+        throw new ConflictException(
+          'Concurrent idempotent create_order conflict; retry with the same key.',
+        );
+      }
+      throw err;
+    }
+  }
 
-      const items = itemEntries.map((entry) =>
-        manager.create(OrderItem, {
-          order_id: savedOrder.id,
-          sku_id: entry.skuId,
-          quantity: entry.quantity,
-          unit_price_cents: entry.unitPriceCents,
-        }),
-      );
-      await manager.save(items);
-
-      // 5. Store idempotency record — scoped by operation + actor + store
-      //    so different tenants can legitimately reuse the same key
-      //    without colliding on the lookup, and so the read-back path
-      //    can never serve a foreign tenant's order.
-      const idempotencyRecord = manager.create(IdempotencyKey, {
-        key: dto.idempotencyKey,
+  /**
+   * Deterministic scoped-replay lookup used by BOTH the happy-path
+   * pre-check and the post-unique-violation recovery branch. Returns
+   * the existing order wrapped as a dedup result when the scoped
+   * idempotency row resolves to an order that belongs to the caller
+   * (same store + same user). Returns `null` when there is no row at
+   * all — the caller should proceed with the create path. Throws
+   * `NotFoundException` when the row exists but the resolved order
+   * fails the ownership check (defense-in-depth against legacy
+   * un-backfilled rows / migration anomalies).
+   */
+  private async replayScopedOrder(
+    idempotencyKey: string,
+    user: any,
+    callerStoreId: string | null,
+  ): Promise<{ order: Order; alreadyExisted: boolean } | null> {
+    const existingKey = await this.idempotencyRepo.findOne({
+      where: {
         operation_type: 'create_order',
         actor_id: user.id,
         store_id: callerStoreId,
-        response_body: { orderId: savedOrder.id },
-      });
-      await manager.save(idempotencyRecord);
+        key: idempotencyKey,
+      },
+    });
+    if (!existingKey) return null;
 
-      const fullOrder = await manager.findOne(Order, {
-        where: { id: savedOrder.id },
+    const orderId: string | undefined = existingKey.response_body?.orderId;
+    if (orderId) {
+      const existingOrder = await this.orderRepo.findOne({
+        where: { id: orderId },
         relations: ['items'],
       });
+      if (
+        existingOrder &&
+        (callerStoreId == null || existingOrder.store_id === callerStoreId) &&
+        existingOrder.user_id === user.id
+      ) {
+        return { order: existingOrder, alreadyExisted: true };
+      }
+    }
+    throw new NotFoundException(
+      'Idempotency key exists but does not belong to this scope',
+    );
+  }
 
-      return { order: fullOrder, alreadyExisted: false };
-    });
+  /**
+   * Exact-name allowlist of unique constraints/indexes whose
+   * SQLSTATE 23505 from `createOrder`'s transaction we MUST resolve
+   * as an idempotency-replay instead of a 500.
+   *
+   * Today only `UQ_idempotency_keys_scoped` (installed by
+   * `1711900000003-ScopeIdempotencyKeys`) is in scope. Hard-coding
+   * exact names (not a substring regex) eliminates the risk of
+   * future, unrelated unique constraints whose name happens to
+   * contain the substring "idempotency" being silently
+   * mis-classified and swallowed as a phantom replay.
+   *
+   * If a future migration adds another constraint this transaction
+   * can legitimately collide on, extend the set here and NOWHERE
+   * ELSE in the service.
+   */
+  private static readonly IDEMPOTENCY_UNIQUE_CONSTRAINTS: ReadonlySet<string> =
+    new Set(['UQ_idempotency_keys_scoped']);
+
+  /**
+   * Robustly extract pg-style fields (SQLSTATE + constraint name)
+   * across the pg driver and every TypeORM wrapper shape observed
+   * in the codebase. Walks common nested wrappers
+   * (`driverError`, `originalError`, `cause`) so a single call
+   * returns the same values regardless of which layer surfaced the
+   * error — e.g. typeorm's `QueryFailedError` carries the pg fields
+   * on `.driverError`, and some pooled-connection paths nest another
+   * level deeper under `.originalError`.
+   */
+  private extractPgErrorFields(err: any): {
+    code: string | undefined;
+    constraint: string | undefined;
+  } {
+    let code: string | undefined;
+    let constraint: string | undefined;
+    const seen = new Set<any>();
+    let node: any = err;
+    while (node && typeof node === 'object' && !seen.has(node)) {
+      seen.add(node);
+      if (!code && typeof node.code === 'string') code = node.code;
+      if (!constraint && typeof node.constraint === 'string') {
+        constraint = node.constraint;
+      }
+      if (code && constraint) break;
+      node = node.driverError ?? node.originalError ?? node.cause ?? null;
+    }
+    return { code, constraint };
+  }
+
+  /**
+   * True iff the thrown error is a Postgres unique-constraint
+   * violation from the *specific* scoped idempotency_keys index.
+   *
+   * - SQLSTATE must be exactly `23505`.
+   * - Constraint name, when available, must be in the exact
+   *   allowlist. No substring / regex fallback — that was the prior
+   *   false-positive surface.
+   * - When pg omits the constraint field (older drivers, certain
+   *   error paths), we refuse to guess and let the error propagate.
+   *   This fails CLOSED for correctness: worst case is a visible
+   *   error the client can retry on, never a silent replay that
+   *   could leak or double-book.
+   */
+  private isIdempotencyUniqueViolation(err: any): boolean {
+    if (!err) return false;
+    const { code, constraint } = this.extractPgErrorFields(err);
+    if (code !== '23505') return false;
+    if (!constraint) return false;
+    return OrdersService.IDEMPOTENCY_UNIQUE_CONSTRAINTS.has(constraint);
+  }
+
+  /**
+   * Post-conflict replay with a very small bounded retry. Closes
+   * the narrow read-after-write visibility window where the winner's
+   * commit exists in Postgres but a follow-up read on our connection
+   * has not yet seen it (same pool, snapshot lag, etc.). Two tries
+   * with jittered backoff is sufficient in practice; past that we
+   * surface a 409 so the client retries with the same key instead
+   * of leaking a 500.
+   *
+   * Jitter is bypassed under `NODE_ENV === 'test'` so unit tests
+   * are deterministic and zero-wait.
+   */
+  private async replayScopedOrderWithRetry(
+    idempotencyKey: string,
+    user: any,
+    callerStoreId: string | null,
+  ): Promise<{ order: Order; alreadyExisted: boolean } | null> {
+    const maxAttempts = 2;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const replay = await this.replayScopedOrder(
+        idempotencyKey,
+        user,
+        callerStoreId,
+      );
+      if (replay) return replay;
+      if (attempt < maxAttempts - 1) {
+        await this.replayBackoff(attempt);
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Extracted for testability: jittered backoff between replay
+   * attempts. Zero-wait under NODE_ENV=test so the retry unit tests
+   * run instantly and are not flaky.
+   */
+  protected replayBackoff(attempt: number): Promise<void> {
+    if (process.env.NODE_ENV === 'test') return Promise.resolve();
+    const base = 5; // ms
+    const jitter = Math.floor(Math.random() * 6); // 0..5ms
+    const delay = base * (attempt + 1) + jitter;
+    return new Promise((resolve) => setTimeout(resolve, delay));
   }
 
   private findOrderScoped(id: string, user: any): Promise<Order> {

@@ -65,20 +65,21 @@ describe('Questions API', () => {
     subjQuestionId = res.body.id;
   });
 
-  it('GET /questions → 200', async () => {
+  it('GET /questions → 200 returns the created questions', async () => {
     logStep('GET', '/questions');
     const res = await request(server).get('/questions').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/questions', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
-    expect(res.body.length).toBeGreaterThan(0);
+    const ids = res.body.map((q: any) => q.id);
+    expect(ids).toEqual(expect.arrayContaining([objQuestionId, subjQuestionId]));
   });
 
   it('GET /questions?type=objective → 200 filtered', async () => {
     logStep('GET', '/questions?type=objective');
     const res = await request(server).get('/questions?type=objective').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/questions', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
     expect(res.body.every((q: any) => q.type === 'objective')).toBe(true);
   });
 
@@ -86,31 +87,37 @@ describe('Questions API', () => {
     logStep('GET', `/questions/${objQuestionId}`);
     const res = await request(server).get(`/questions/${objQuestionId}`).set('Authorization', `Bearer ${token}`);
     logStep('GET', 'question', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
     expect(res.body.id).toBe(objQuestionId);
+    expect(res.body.type).toBe('objective');
   });
 
-  it('PATCH /questions/:id → 200', async () => {
+  it('PATCH /questions/:id → 200 with updated body', async () => {
     logStep('PATCH', `/questions/${subjQuestionId}`);
     const res = await request(server).patch(`/questions/${subjQuestionId}`).set('Authorization', `Bearer ${token}`)
       .send({ body: `Updated: Explain gravity ${U}` });
     logStep('PATCH', 'question', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
+    expect(res.body.id).toBe(subjQuestionId);
+    expect(res.body.body).toBe(`Updated: Explain gravity ${U}`);
   });
 
-  it('POST /questions/:id/approve → 200', async () => {
+  it('POST /questions/:id/approve → 201, status=approved', async () => {
     logStep('POST', `/questions/${objQuestionId}/approve`);
     const res = await request(server).post(`/questions/${objQuestionId}/approve`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'approve', res.status);
-    expect([200, 201]).toContain(res.status);
+    // @Post with no @HttpCode → NestJS default 201.
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe(objQuestionId);
     expect(res.body.status).toBe('approved');
   });
 
-  it('POST /questions/:id/reject → 200', async () => {
+  it('POST /questions/:id/reject → 201, status=rejected', async () => {
     logStep('POST', `/questions/${subjQuestionId}/reject`);
     const res = await request(server).post(`/questions/${subjQuestionId}/reject`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'reject', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(201);
+    expect(res.body.id).toBe(subjQuestionId);
     expect(res.body.status).toBe('rejected');
   });
 
@@ -136,11 +143,14 @@ describe('Questions API', () => {
     logStep('GET', `/questions/${objQuestionId}/explanations`);
     const res = await request(server).get(`/questions/${objQuestionId}/explanations`).set('Authorization', `Bearer ${token}`);
     logStep('GET', 'explanations', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body)).toBe(true);
     expect(res.body.length).toBeGreaterThanOrEqual(2);
+    const versions = res.body.map((e: any) => e.version_number).sort();
+    expect(versions).toEqual(expect.arrayContaining([1, 2]));
   });
 
-  it('POST /questions/import → 200', async () => {
+  it('POST /questions/import → 201, count matches input', async () => {
     logStep('POST', '/questions/import');
     const res = await request(server).post('/questions/import').set('Authorization', `Bearer ${token}`)
       .send({
@@ -150,7 +160,8 @@ describe('Questions API', () => {
         ],
       });
     logStep('POST', '/questions/import', res.status);
-    expect([200, 201]).toContain(res.status);
+    // @Post with no @HttpCode → NestJS default 201.
+    expect(res.status).toBe(201);
     expect(res.body.count).toBe(2);
   });
 
@@ -158,7 +169,7 @@ describe('Questions API', () => {
     logStep('GET', '/questions/export');
     const res = await request(server).get('/questions/export').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/questions/export', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/text\/csv/);
     expect(res.text).toContain('id,');
   });
@@ -167,13 +178,14 @@ describe('Questions API', () => {
     logStep('GET', `/questions/${objQuestionId}/wrong-answer-stats`);
     const res = await request(server).get(`/questions/${objQuestionId}/wrong-answer-stats`).set('Authorization', `Bearer ${token}`);
     logStep('GET', 'wrong-answer-stats', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
   });
 
   it('DELETE /questions/:id → 200', async () => {
     logStep('DELETE', `/questions/${subjQuestionId}`);
     const res = await request(server).delete(`/questions/${subjQuestionId}`).set('Authorization', `Bearer ${token}`);
     logStep('DELETE', 'question', res.status);
-    expect([200, 204]).toContain(res.status);
+    // @Delete with no @HttpCode → NestJS default 200.
+    expect(res.status).toBe(200);
   });
 });

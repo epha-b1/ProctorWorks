@@ -54,45 +54,57 @@ describe('Orders API', () => {
     orderId = res.body.id;
   });
 
-  it('POST /orders same idempotency key → 200', async () => {
+  it('POST /orders same idempotency key → 200 dedup with identical body', async () => {
     logStep('POST', '/orders (dup)');
     const res = await request(server).post('/orders').set('Authorization', `Bearer ${token}`)
       .send({ idempotencyKey: `ord-${U}-1`, items: [{ skuId, quantity: 3 }] });
     logStep('POST', '/orders', res.status);
-    expect([200, 201]).toContain(res.status);
+    // Controller pins HttpStatus.OK on the dedup branch and
+    // HttpStatus.CREATED on the create branch — strict 200 here.
+    expect(res.status).toBe(200);
     expect(res.body.id).toBe(orderId);
+    expect(res.body.total_cents).toBe(3000);
+    expect(res.body.status).toBe('pending');
   });
 
-  it('GET /orders → 200', async () => {
+  it('GET /orders → 200 returning the created order', async () => {
     logStep('GET', '/orders');
     const res = await request(server).get('/orders').set('Authorization', `Bearer ${token}`);
     logStep('GET', '/orders', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
+    const found = res.body.find((o: any) => o.id === orderId);
+    expect(found).toBeDefined();
+    expect(found.total_cents).toBe(3000);
   });
 
-  it('GET /orders/:id → 200', async () => {
+  it('GET /orders/:id → 200 with totals and status', async () => {
     logStep('GET', `/orders/${orderId}`);
     const res = await request(server).get(`/orders/${orderId}`).set('Authorization', `Bearer ${token}`);
     logStep('GET', `/orders/${orderId}`, res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(200);
     expect(res.body.id).toBe(orderId);
+    expect(res.body.total_cents).toBe(3000);
+    expect(res.body.status).toBe('pending');
   });
 
-  it('POST /orders/:id/confirm → 200', async () => {
+  it('POST /orders/:id/confirm → 201 transitions to confirmed', async () => {
     logStep('POST', `/orders/${orderId}/confirm`);
     const res = await request(server).post(`/orders/${orderId}/confirm`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'confirm', res.status);
-    expect([200, 201]).toContain(res.status);
+    // @Post with no @HttpCode → NestJS default 201.
+    expect(res.status).toBe(201);
     expect(res.body.status).toBe('confirmed');
+    expect(res.body.id).toBe(orderId);
   });
 
-  it('POST /orders/:id/fulfill → 200', async () => {
+  it('POST /orders/:id/fulfill → 201 transitions to fulfilled', async () => {
     logStep('POST', `/orders/${orderId}/fulfill`);
     const res = await request(server).post(`/orders/${orderId}/fulfill`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'fulfill', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(201);
     expect(res.body.status).toBe('fulfilled');
+    expect(res.body.id).toBe(orderId);
   });
 
   it('POST /orders/:id/cancel on fulfilled → 409', async () => {
@@ -102,25 +114,30 @@ describe('Orders API', () => {
     expect(res.status).toBe(409);
   });
 
-  it('Cancel from pending → 200', async () => {
+  it('Cancel from pending → 201, status=cancelled, timestamp set', async () => {
     const cr = await request(server).post('/orders').set('Authorization', `Bearer ${token}`)
       .send({ idempotencyKey: `ord-${U}-2`, items: [{ skuId, quantity: 1 }] });
+    expect(cr.status).toBe(201);
     logStep('POST', `/orders/${cr.body.id}/cancel`);
     const res = await request(server).post(`/orders/${cr.body.id}/cancel`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'cancel', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(201);
     expect(res.body.status).toBe('cancelled');
+    expect(res.body.id).toBe(cr.body.id);
   });
 
-  it('Cancel from confirmed → 200', async () => {
+  it('Cancel from confirmed → 201, status=cancelled', async () => {
     const cr = await request(server).post('/orders').set('Authorization', `Bearer ${token}`)
       .send({ idempotencyKey: `ord-${U}-3`, items: [{ skuId, quantity: 1 }] });
-    await request(server).post(`/orders/${cr.body.id}/confirm`).set('Authorization', `Bearer ${token}`);
+    expect(cr.status).toBe(201);
+    const cf = await request(server).post(`/orders/${cr.body.id}/confirm`).set('Authorization', `Bearer ${token}`);
+    expect(cf.status).toBe(201);
     logStep('POST', `/orders/${cr.body.id}/cancel`);
     const res = await request(server).post(`/orders/${cr.body.id}/cancel`).set('Authorization', `Bearer ${token}`);
     logStep('POST', 'cancel', res.status);
-    expect([200, 201]).toContain(res.status);
+    expect(res.status).toBe(201);
     expect(res.body.status).toBe('cancelled');
+    expect(res.body.id).toBe(cr.body.id);
   });
 
   it('POST /orders without idempotencyKey → 400', async () => {
@@ -356,9 +373,12 @@ describe('Orders API', () => {
           idempotencyKey: sharedKey,
           items: [{ skuId: crossSkuA, quantity: 1 }],
         });
-      expect([200, 201]).toContain(aReplay.status);
+      // Same-scope replay → strictly 200 (controller pins
+      // HttpStatus.OK on the dedup branch).
+      expect(aReplay.status).toBe(200);
       expect(aReplay.body.id).toBe(orderAId);
       expect(aReplay.body.store_id).toBe(crossA.id);
+      expect(aReplay.body.total_cents).toBe(5_555);
     });
   });
 });

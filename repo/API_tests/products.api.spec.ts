@@ -112,7 +112,7 @@ describe('Products, Categories, Brands & SKUs API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', '/categories', res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(200);
       expect(Array.isArray(res.body)).toBe(true);
 
       const found = res.body.find((c: any) => c.id === categoryId);
@@ -151,7 +151,7 @@ describe('Products, Categories, Brands & SKUs API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', '/brands', res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(200);
       expect(Array.isArray(res.body)).toBe(true);
 
       const found = res.body.find((b: any) => b.id === brandId);
@@ -196,7 +196,7 @@ describe('Products, Categories, Brands & SKUs API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', '/products', res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(200);
       expect(Array.isArray(res.body)).toBe(true);
 
       const found = res.body.find((p: any) => p.id === productId);
@@ -219,7 +219,7 @@ describe('Products, Categories, Brands & SKUs API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', `/products/${productId}`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('id', productId);
       expect(res.body).toHaveProperty('name', productName);
       expect(res.body).toHaveProperty('category');
@@ -242,7 +242,7 @@ describe('Products, Categories, Brands & SKUs API', () => {
         .send({ name: updatedProductName });
       logStep('PATCH', `/products/${productId}`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('id', productId);
       expect(res.body).toHaveProperty('name', updatedProductName);
     });
@@ -292,7 +292,7 @@ describe('Products, Categories, Brands & SKUs API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('GET', `/products/${productId}/skus`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(200);
       expect(Array.isArray(res.body)).toBe(true);
       expect(res.body.length).toBeGreaterThanOrEqual(1);
 
@@ -310,27 +310,28 @@ describe('Products, Categories, Brands & SKUs API', () => {
   //     and must be explicitly approved by a reviewer.
   // -----------------------------------------------------------------------
   describe('POST /products/:id/publish', () => {
-    it('should return 200 and set status to pending_review for platform_admin (no bypass)', async () => {
+    it('should return 201 and set status to pending_review for platform_admin (no bypass)', async () => {
       logStep('POST', `/products/${productId}/publish`);
       const res = await request(server)
         .post(`/products/${productId}/publish`)
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('POST', `/products/${productId}/publish`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      // @Post with no @HttpCode → NestJS default 201.
+      expect(res.status).toBe(201);
       expect(res.body).toHaveProperty('id', productId);
       // Critical: even platform_admin lands on pending_review here.
       expect(res.body).toHaveProperty('status', 'pending_review');
     });
 
-    it('POST /products/:id/approve → 200, status published (explicit reviewer approval)', async () => {
+    it('POST /products/:id/approve → 201, status published (explicit reviewer approval)', async () => {
       logStep('POST', `/products/${productId}/approve`);
       const res = await request(server)
         .post(`/products/${productId}/approve`)
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('POST', `/products/${productId}/approve`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(201);
       expect(res.body).toHaveProperty('id', productId);
       expect(res.body).toHaveProperty('status', 'published');
     });
@@ -340,14 +341,14 @@ describe('Products, Categories, Brands & SKUs API', () => {
   // 12. POST /products/:id/unpublish → 200
   // -----------------------------------------------------------------------
   describe('POST /products/:id/unpublish', () => {
-    it('should return 200 and set status to unpublished', async () => {
+    it('should return 201 and set status to unpublished', async () => {
       logStep('POST', `/products/${productId}/unpublish`);
       const res = await request(server)
         .post(`/products/${productId}/unpublish`)
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('POST', `/products/${productId}/unpublish`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(201);
       expect(res.body).toHaveProperty('id', productId);
       expect(res.body).toHaveProperty('status', 'unpublished');
     });
@@ -371,7 +372,7 @@ describe('Products, Categories, Brands & SKUs API', () => {
         });
       logStep('PATCH', `/skus/${skuId}`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      expect(res.status).toBe(200);
       expect(res.body).toHaveProperty('id', skuId);
       expect(res.body).toHaveProperty('price_cents', 2499);
       expect(res.body.attributes).toEqual({ color: 'white', size: 'XL' });
@@ -391,7 +392,8 @@ describe('Products, Categories, Brands & SKUs API', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       logStep('DELETE', `/products/${productId}`, res.status);
 
-      expect([200, 201]).toContain(res.status);
+      // @Delete with no @HttpCode → NestJS default 200.
+      expect(res.status).toBe(200);
     });
 
     it('should return 404 when fetching the deleted product', async () => {
