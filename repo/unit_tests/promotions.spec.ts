@@ -926,4 +926,333 @@ describe('PromotionsService', () => {
       });
     });
   });
+
+  /* -------------------------------------------------------------- */
+  /*  Defensive / long-tail branches                                  */
+  /*                                                                 */
+  /*  Closes remaining branches in findPromotions / findCoupons /    */
+  /*  updatePromotion / deletePromotion / expireCoupon /             */
+  /*  resolvePromotions edge paths + handleExpiredCoupons cron.      */
+  /*  These are the non-happy-path branches documented in README's    */
+  /*  coverage-gap notes.                                             */
+  /* -------------------------------------------------------------- */
+  describe('long-tail defensive branches', () => {
+    describe('findPromotions / findCoupons', () => {
+      it('findPromotions without storeId → unscoped find', async () => {
+        const { service, promotionRepo } = createService();
+        promotionRepo.find.mockResolvedValue([]);
+        await service.findPromotions();
+        expect(promotionRepo.find).toHaveBeenCalledWith({ where: {} });
+      });
+
+      it('findPromotions with storeId → scoped find', async () => {
+        const { service, promotionRepo } = createService();
+        promotionRepo.find.mockResolvedValue([]);
+        await service.findPromotions('store-7');
+        expect(promotionRepo.find).toHaveBeenCalledWith({
+          where: { store_id: 'store-7' },
+        });
+      });
+
+      it('findCoupons without storeId → unscoped find', async () => {
+        const { service, couponRepo } = createService();
+        couponRepo.find.mockResolvedValue([]);
+        await service.findCoupons();
+        expect(couponRepo.find).toHaveBeenCalledWith({ where: {} });
+      });
+
+      it('findCoupons with storeId → scoped find', async () => {
+        const { service, couponRepo } = createService();
+        couponRepo.find.mockResolvedValue([]);
+        await service.findCoupons('store-9');
+        expect(couponRepo.find).toHaveBeenCalledWith({
+          where: { store_id: 'store-9' },
+        });
+      });
+    });
+
+    describe('updatePromotion field-by-field application', () => {
+      it('throws NotFoundException when the promo does not exist in scope', async () => {
+        const { service, promotionRepo } = createService();
+        promotionRepo.findOne.mockResolvedValue(null);
+        await expect(
+          service.updatePromotion('missing-id', { name: 'x' }, 'store-1'),
+        ).rejects.toThrow(NotFoundException);
+        // Scope-narrow predicate propagated into the findOne where clause.
+        expect(promotionRepo.findOne).toHaveBeenCalledWith({
+          where: { id: 'missing-id', store_id: 'store-1' },
+        });
+      });
+
+      it('applies every patchable field exactly when present in the DTO', async () => {
+        const { service, promotionRepo } = createService();
+        const existing = makePromotion({
+          id: 'p-1',
+          priority: 1,
+          min_order_cents: null,
+          starts_at: null,
+          ends_at: null,
+          redemption_cap: null,
+          active: true,
+        });
+        promotionRepo.findOne.mockResolvedValue(existing);
+        promotionRepo.save.mockImplementation(async (p: any) => p);
+
+        const updated = await service.updatePromotion(
+          'p-1',
+          {
+            name: 'Renamed',
+            type: PromotionType.THRESHOLD,
+            priority: 50,
+            discountType: DiscountType.PERCENTAGE,
+            discountValue: 25,
+            minOrderCents: 1000,
+            startsAt: '2026-05-01T00:00:00Z',
+            endsAt: '2026-06-01T00:00:00Z',
+            redemptionCap: 100,
+            active: false,
+          } as any,
+        );
+        expect(updated.name).toBe('Renamed');
+        expect(updated.type).toBe(PromotionType.THRESHOLD);
+        expect(updated.priority).toBe(50);
+        expect(updated.discount_type).toBe(DiscountType.PERCENTAGE);
+        expect(updated.discount_value).toBe(25);
+        expect(updated.min_order_cents).toBe(1000);
+        expect(updated.starts_at).toEqual(new Date('2026-05-01T00:00:00Z'));
+        expect(updated.ends_at).toEqual(new Date('2026-06-01T00:00:00Z'));
+        expect(updated.redemption_cap).toBe(100);
+        expect(updated.active).toBe(false);
+      });
+
+      it('startsAt / endsAt null → stored as null (explicit clear)', async () => {
+        const { service, promotionRepo } = createService();
+        promotionRepo.findOne.mockResolvedValue(
+          makePromotion({
+            starts_at: new Date('2025-01-01'),
+            ends_at: new Date('2025-12-31'),
+          }),
+        );
+        promotionRepo.save.mockImplementation(async (p: any) => p);
+        const result = await service.updatePromotion('p-1', {
+          startsAt: null,
+          endsAt: null,
+        } as any);
+        expect(result.starts_at).toBeNull();
+        expect(result.ends_at).toBeNull();
+      });
+
+      it('no-op DTO leaves every field unchanged', async () => {
+        const { service, promotionRepo } = createService();
+        const existing = makePromotion({ priority: 7 });
+        promotionRepo.findOne.mockResolvedValue(existing);
+        promotionRepo.save.mockImplementation(async (p: any) => p);
+        const result = await service.updatePromotion('p-1', {} as any);
+        expect(result.priority).toBe(7);
+        expect(result.name).toBe(existing.name);
+      });
+    });
+
+    describe('deletePromotion', () => {
+      it('removes in scope', async () => {
+        const { service, promotionRepo } = createService();
+        const existing = makePromotion();
+        promotionRepo.findOne.mockResolvedValue(existing);
+        promotionRepo.remove = jest.fn().mockResolvedValue(existing);
+        await service.deletePromotion('p-1', 'store-1');
+        expect(promotionRepo.findOne).toHaveBeenCalledWith({
+          where: { id: 'p-1', store_id: 'store-1' },
+        });
+        expect(promotionRepo.remove).toHaveBeenCalled();
+      });
+
+      it('throws NotFound when not in scope', async () => {
+        const { service, promotionRepo } = createService();
+        promotionRepo.findOne.mockResolvedValue(null);
+        await expect(
+          service.deletePromotion('missing', 'store-1'),
+        ).rejects.toThrow(NotFoundException);
+      });
+    });
+
+    describe('expireCoupon', () => {
+      it('platform_admin can expire any coupon → status flips to EXPIRED', async () => {
+        const { service, couponRepo } = createService();
+        const coupon = makeCoupon();
+        couponRepo.findOne.mockResolvedValue(coupon);
+        couponRepo.save.mockImplementation(async (c: any) => c);
+        const result = await service.expireCoupon('coupon-1', {
+          role: 'platform_admin',
+        });
+        expect(result.status).toBe(CouponStatus.EXPIRED);
+      });
+
+      it('throws NotFound when coupon does not exist', async () => {
+        const { service, couponRepo } = createService();
+        couponRepo.findOne.mockResolvedValue(null);
+        await expect(
+          service.expireCoupon('missing', { role: 'platform_admin' }),
+        ).rejects.toThrow(NotFoundException);
+      });
+
+      it('store_admin expiring a foreign-store coupon → NotFound (hiding policy)', async () => {
+        const { service, couponRepo } = createService();
+        couponRepo.findOne.mockResolvedValue(makeCoupon({ store_id: 'store-OTHER' }));
+        await expect(
+          service.expireCoupon('coupon-1', {
+            role: 'store_admin',
+            storeId: 'store-1',
+          }),
+        ).rejects.toThrow(NotFoundException);
+      });
+    });
+
+    describe('resolvePromotions edge paths', () => {
+      function setupResolve(promotions: Promotion[], coupon: Coupon | null) {
+        const { service, promotionRepo, couponRepo, claimRepo } = createService();
+        const qb: any = {};
+        qb.where = jest.fn().mockReturnValue(qb);
+        qb.andWhere = jest.fn().mockReturnValue(qb);
+        qb.getMany = jest.fn().mockResolvedValue(promotions);
+        promotionRepo.createQueryBuilder.mockReturnValue(qb);
+        claimRepo.findOne.mockResolvedValue(null);
+        couponRepo.findOne.mockResolvedValue(coupon);
+        return { service, qb };
+      }
+
+      it('no promotions + no coupon → zero discount, null selections', async () => {
+        const { service } = setupResolve([], null);
+        const res = await service.resolvePromotions(10000, 'u-1', 'store-1');
+        expect(res.selectedPromotion).toBeNull();
+        expect(res.selectedCoupon).toBeNull();
+        expect(res.totalDiscount).toBe(0);
+      });
+
+      it('auto promo with discount=0 (below min_order_cents) → not selected', async () => {
+        const promo = makePromotion({
+          id: 'too-expensive',
+          min_order_cents: 100000,
+          discount_value: 500,
+        });
+        const { service } = setupResolve([promo], null);
+        const res = await service.resolvePromotions(1000, 'u-1', 'store-1');
+        expect(res.selectedPromotion).toBeNull();
+        expect(res.totalDiscount).toBe(0);
+      });
+
+      it('coupon with ends_at in the past → rejected, no discount applied', async () => {
+        const expired = makeCoupon({
+          ends_at: new Date('2000-01-01'),
+        });
+        const { service } = setupResolve([], expired);
+        const res = await service.resolvePromotions(
+          5000,
+          'u-1',
+          'store-1',
+          'SAVE10',
+        );
+        expect(res.selectedCoupon).toBeNull();
+        expect(res.totalDiscount).toBe(0);
+      });
+
+      it('coupon with starts_at in the future → rejected (not yet active)', async () => {
+        const future = makeCoupon({
+          starts_at: new Date('2099-01-01'),
+        });
+        const { service } = setupResolve([], future);
+        const res = await service.resolvePromotions(
+          5000,
+          'u-1',
+          'store-1',
+          'SAVE10',
+        );
+        expect(res.selectedCoupon).toBeNull();
+      });
+
+      it('cross-store coupon → not applied (silent rejection, logged as warn)', async () => {
+        const foreign = makeCoupon({ store_id: 'store-OTHER' });
+        const { service } = setupResolve([], foreign);
+        const res = await service.resolvePromotions(
+          5000,
+          'u-1',
+          'store-1',
+          'SAVE10',
+        );
+        expect(res.selectedCoupon).toBeNull();
+        expect(res.totalDiscount).toBe(0);
+      });
+
+      it('coupon-only (no auto promo): coupon promotion becomes selectedPromotion', async () => {
+        const couponPromo = makePromotion({
+          id: 'p-coupon',
+          discount_value: 400,
+        });
+        const coupon = makeCoupon({
+          promotion_id: 'p-coupon',
+          promotion: couponPromo,
+        });
+        const { service } = setupResolve([], coupon);
+        const res = await service.resolvePromotions(
+          5000,
+          'u-1',
+          'store-1',
+          'SAVE10',
+        );
+        expect(res.selectedCoupon?.id).toBe('coupon-1');
+        expect(res.selectedPromotion?.id).toBe('p-coupon');
+        expect(res.totalDiscount).toBe(400);
+      });
+
+      it('coupon code not found in DB → no coupon, no auto promo → zero discount', async () => {
+        const { service } = setupResolve([], null);
+        const res = await service.resolvePromotions(
+          5000,
+          'u-1',
+          'store-1',
+          'NONEXIST',
+        );
+        expect(res.selectedCoupon).toBeNull();
+      });
+    });
+
+    describe('handleExpiredCoupons cron', () => {
+      it('UPDATEs every ACTIVE coupon whose ends_at is in the past to EXPIRED', async () => {
+        const { service, couponRepo } = createService();
+        const execute = jest.fn().mockResolvedValue({ affected: 3 });
+        const qb: any = {};
+        qb.update = jest.fn().mockReturnValue(qb);
+        qb.set = jest.fn().mockReturnValue(qb);
+        qb.where = jest.fn().mockReturnValue(qb);
+        qb.andWhere = jest.fn().mockReturnValue(qb);
+        qb.execute = execute;
+        couponRepo.createQueryBuilder.mockReturnValue(qb);
+
+        await (service as any).handleExpiredCoupons();
+
+        expect(qb.set).toHaveBeenCalledWith({ status: CouponStatus.EXPIRED });
+        expect(qb.where).toHaveBeenCalledWith('status = :status', {
+          status: CouponStatus.ACTIVE,
+        });
+        expect(qb.andWhere).toHaveBeenCalledWith('ends_at IS NOT NULL');
+        expect(execute).toHaveBeenCalled();
+      });
+
+      it('cron no-op when there are zero expired rows (quiet path)', async () => {
+        const { service, couponRepo } = createService();
+        const qb: any = {};
+        qb.update = jest.fn().mockReturnValue(qb);
+        qb.set = jest.fn().mockReturnValue(qb);
+        qb.where = jest.fn().mockReturnValue(qb);
+        qb.andWhere = jest.fn().mockReturnValue(qb);
+        qb.execute = jest.fn().mockResolvedValue({ affected: 0 });
+        couponRepo.createQueryBuilder.mockReturnValue(qb);
+
+        // Should complete without throwing — the logger.log call is
+        // gated on affected > 0.
+        await expect(
+          (service as any).handleExpiredCoupons(),
+        ).resolves.toBeUndefined();
+      });
+    });
+  });
 });
