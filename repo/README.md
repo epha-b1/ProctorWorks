@@ -1,105 +1,168 @@
 # ProctorWorks
 
-Offline operations platform for managing a catalog-driven practice product business and reservable study spaces.
+**Project Type: backend**
+
+Offline operations platform for managing a catalog-driven practice product business and reservable study spaces. A NestJS + TypeORM + PostgreSQL API packaged to run on a single Docker host with no external connectivity.
 
 ## Stack
 
-NestJS + TypeORM + PostgreSQL. Runs on a single Docker host with no external connectivity.
+NestJS + TypeORM + PostgreSQL. Runs on a single Docker host with no external connectivity. Every operator flow — startup, tests, and verification — is fully Docker-contained and requires no host Node, host Postgres, or host `npm install`.
 
-## Quick Start (Docker)
+## Quick Start (Docker — the only supported path)
+
+Both Compose CLI variants are accepted:
 
 ```bash
+# Compose v2 (plugin)
 docker compose up --build
+
+# Compose v1 / symlinked binaries
+docker-compose up --build
 ```
+
+Either command stands up the full stack: the `api` service (NestJS) and the `db` service (Postgres 16) — plus runs migrations and seed data on first boot.
 
 - **API**: http://localhost:3000
 - **Swagger UI**: http://localhost:3000/api/docs
 - **Health check**: http://localhost:3000/health
+- **Postgres**: host-port `5433` (internal `5432`)
 
-## Quick Start (Local / No Docker)
-
-Requires Node 20+ and a running PostgreSQL instance.
+Stop and clean up:
 
 ```bash
-# 1. Set environment
-export DATABASE_URL=postgres://proctorworks:proctorworks@127.0.0.1:5433/proctorworks
-export JWT_SECRET=dev-jwt-secret-min-32-chars-long-x
-export ENCRYPTION_KEY=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
-
-# 2. Install and build
-npm install --legacy-peer-deps
-npm run build
-
-# 3. Start (ensure DB is running with matching credentials)
-npm start
-
-# 4. Run tests
-npm run test:unit -- --runInBand
-npm run test:api -- --runInBand
+docker compose down -v   # or: docker-compose down -v
 ```
 
-## Default Credentials
+## Verification
 
-| Username | Password     | Role            |
-|----------|-------------|-----------------|
-| admin    | Admin1234!  | platform_admin  |
-| store_admin | Admin1234! | store_admin  |
-| reviewer | Admin1234!  | content_reviewer |
-| auditor  | Admin1234!  | auditor         |
+After `docker compose up --build` (or `docker-compose up --build`) reports both services as healthy, run these from the host to prove the deployed surface end-to-end. No host dependencies beyond `curl`.
+
+### 1. Liveness — `GET /health`
+
+```bash
+curl -sS http://localhost:3000/health
+```
+
+Expected response (shape; `timestamp` is a current ISO-8601 string):
+
+```json
+{ "status": "ok", "database": "connected", "timestamp": "2026-..." }
+```
+
+Success criteria: HTTP `200`, `status === "ok"`, `database === "connected"`.
+
+### 2. Authentication — `POST /auth/login`
+
+```bash
+curl -sS -X POST http://localhost:3000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"Admin1234!"}'
+```
+
+Expected response shape:
+
+```json
+{ "accessToken": "eyJ...<JWT>...", "user": { "id": "...", "username": "admin", "role": "platform_admin" } }
+```
+
+Success criteria: HTTP `200`, `accessToken` is a non-empty JWT string, `user.role === "platform_admin"`.
+
+### 3. Protected endpoint with bearer token — `GET /auth/me`
+
+Reuse the token from step 2:
+
+```bash
+TOKEN=$(curl -sS -X POST http://localhost:3000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"Admin1234!"}' | sed -E 's/.*"accessToken":"([^"]+)".*/\1/')
+
+curl -sS http://localhost:3000/auth/me -H "Authorization: Bearer $TOKEN"
+```
+
+Expected response shape:
+
+```json
+{ "id": "...", "username": "admin", "role": "platform_admin", "storeId": null }
+```
+
+Success criteria: HTTP `200`, payload echoes the authenticated user (`username === "admin"`). A missing or tampered token yields `401`.
+
+## Demo Credentials
+
+The seed migration installs one user per role so operators can exercise every role matrix immediately after startup:
+
+| Username     | Password    | Role               |
+|--------------|-------------|--------------------|
+| `admin`      | `Admin1234!`| `platform_admin`   |
+| `store_admin`| `Admin1234!`| `store_admin`      |
+| `reviewer`   | `Admin1234!`| `content_reviewer` |
+| `auditor`    | `Admin1234!`| `auditor`          |
+
+These users are created by `1711900000001-SeedDemoData.ts` and are re-applied on every fresh volume. Rotate passwords before any non-dev deployment.
 
 ## Run Tests
 
-```bash
-# Docker (recommended — fully self-contained, runs every suite + coverage gate)
-./run_tests.sh
+The entire test pipeline runs inside Docker via the project's wrapper. No host Node, host Postgres, or host `npm install` is required.
 
-# Local
-npm run test:unit -- --runInBand
-npm run test:api  -- --runInBand
-npm run test:e2e  -- --runInBand   # requires the API to be running at E2E_BASE_URL
-npm run test:cov  -- --runInBand   # enforces the coverage gate
+```bash
+./run_tests.sh
 ```
+
+`run_tests.sh` is the only supported test entrypoint. It:
+
+1. Ensures the `api` and `db` containers are up (`docker compose up -d --build --force-recreate`).
+2. Waits for `/health` to return `{"status":"ok"}`.
+3. Inside the `api` container, runs unit tests (`[3/5]`), API integration tests (`[4/5]`), and the black-box E2E tests (`[5/5]`).
+4. Runs the coverage gate once all three suites are green.
+5. Exits non-zero if any suite OR the coverage gate fails.
+
+Each suite is invoked via `docker compose exec -T api sh -c "npx jest …"` — the jest runner executes inside the container, so there is no host toolchain dependency. `E2E_BASE_URL` defaults to `http://localhost:3000` (the container's own listener) and is injected at exec time.
 
 ### Suites and what they guard
 
-| Folder        | Type                           | Bootstraps Nest in-process? | Hits HTTP?                | Primary contract                              |
-|---------------|--------------------------------|-----------------------------|----------------------------|-----------------------------------------------|
-| `unit_tests/` | Unit (services, pipes, guards) | n/a                         | No                         | Pure logic, branch coverage                    |
-| `API_tests/`  | API integration (supertest)    | Yes (per-suite `AppModule`) | In-process via supertest   | Controller ↔ service ↔ DB contract, strict status codes, payload invariants |
-| `e2e_tests/`  | Black-box E2E (supertest → URL) | **No** — boots against running container | Yes, real network        | Full request pipeline: compression → guard → interceptor → filter → DB, including audit-log side effects |
+| Folder        | Type                                         | Bootstraps Nest in-process? | Hits HTTP?                | Primary contract                              |
+|---------------|----------------------------------------------|-----------------------------|----------------------------|-----------------------------------------------|
+| `unit_tests/` | Unit (services, pipes, guards, interceptors) | n/a                         | No                         | Pure logic, branch coverage                    |
+| `API_tests/`  | API integration (supertest)                  | Yes (per-suite `AppModule`) | In-process via supertest   | Controller ↔ service ↔ DB contract, strict status codes, payload invariants |
+| `e2e_tests/`  | Black-box E2E (supertest → URL)              | **No** — hits the running container | Yes, real network     | Full request pipeline: compression → guard → interceptor → filter → DB, including audit-log side effects |
 
 The E2E suite deliberately does not import `AppModule`. It hits
 `E2E_BASE_URL` (default `http://localhost:3000`) over real HTTP so the
 container boundary is exercised exactly as production traffic would be.
-`run_tests.sh` exports `E2E_BASE_URL` into the `api` container and runs
-jest there, so the URL resolves to the container's own listener and no
-host port forwarding is required.
+`run_tests.sh` exports `E2E_BASE_URL` into the `api` container so the
+URL resolves to the container's own listener.
 
 ### Coverage gate
 
-`jest.config.js` enforces a global `coverageThreshold`:
+`jest.config.js` enforces a global `coverageThreshold` (kept in sync with this section):
 
-- statements ≥ 80%, lines ≥ 80%, functions ≥ 80%, branches ≥ 70%
+| Metric     | Floor |
+|------------|-------|
+| Statements | **93%** |
+| Branches   | **83%** |
+| Functions  | **96%** |
+| Lines      | **94%** |
 
 The gate runs as the final step in `run_tests.sh` (after unit + API +
-E2E) and as `npm run test:cov` locally. A drop below any floor fails
-the build with a non-zero jest exit. Entity files, DTOs, `main.ts`,
-module wiring, and `src/database/**` are excluded from coverage since
-they are declarative glue with no meaningful branches.
+E2E). A drop below any floor fails the build with a non-zero jest
+exit. Entity files, DTOs, `main.ts`, module wiring, `src/database/**`,
+and `src/config/**` are excluded from the denominator because they are
+declarative glue with no meaningful branches.
 
-Skip with `SKIP_COVERAGE=1 ./run_tests.sh` during local iteration when
-the three test suites are green and you just want a fast rerun.
+Skip the coverage phase with `SKIP_COVERAGE=1 ./run_tests.sh` during
+local iteration when the three suites are green and you just want a
+fast rerun.
 
-### Preflight (API tests only)
+### Skipping the rebuild for fast iteration
 
-`npm run test:api` runs a fast Postgres handshake preflight
-(`scripts/check-test-db.js`) before invoking Jest. If the test DB is
-unreachable the preflight exits 1 with a clear diagnostic and the
-suite never starts. Override the target DB with
-`DATABASE_URL=postgres://user:pass@host:port/db npm run test:api`.
-On hosts where docker port-forwarding is flaky, start Postgres in
-host-network mode (see `scripts/check-test-db.js` for the exact
-command) and point `DATABASE_URL` at it.
+`run_tests.sh` rebuilds the `api` image on every run so source edits
+always land in the tested container. Set `SKIP_REBUILD=1` when you
+know the image is already fresh (e.g., in CI after a build step that
+already produced the image) and want to avoid the rebuild overhead:
+
+```bash
+SKIP_REBUILD=1 ./run_tests.sh
+```
 
 ## Services
 

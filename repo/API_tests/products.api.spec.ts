@@ -406,4 +406,99 @@ describe('Products, Categories, Brands & SKUs API', () => {
       expect(res.status).toBe(404);
     });
   });
+
+  // -----------------------------------------------------------------------
+  // 15. DELETE /skus/:id — dedicated endpoint coverage.
+  //
+  // Prior pass covered SKU creation and update but did NOT issue a
+  // real DELETE against the SKU surface. This block seeds a fresh
+  // product + SKU (so it doesn't depend on any state from the
+  // earlier-in-file lifecycle), then exercises the DELETE path for
+  // the happy path, the missing-id path, and the role-denial path.
+  // -----------------------------------------------------------------------
+  describe('DELETE /skus/:id', () => {
+    let skuDelProdId: string;
+    let skuDelSkuId: string;
+    let storeAdminToken: string;
+    const DEL_UNIQ = `skuDel_${UNIQUE}_${Math.random().toString(36).slice(2, 6)}`;
+
+    beforeAll(async () => {
+      // Fresh product + SKU so this block is insulated.
+      const prod = await request(server)
+        .post('/products')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          name: `${DEL_UNIQ}_prod`,
+          categoryId,
+          brandId,
+        });
+      expect(prod.status).toBe(201);
+      skuDelProdId = prod.body.id;
+
+      const sku = await request(server)
+        .post(`/products/${skuDelProdId}/skus`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ skuCode: `${DEL_UNIQ}_SKU`, priceCents: 1234 });
+      expect(sku.status).toBe(201);
+      skuDelSkuId = sku.body.id;
+
+      // Role-denial caller: an auditor. Use the seeded 'auditor'
+      // user from the migration (same password pattern as other suites).
+      storeAdminToken = (
+        await request(server)
+          .post('/auth/login')
+          .send({ username: 'auditor', password: 'Admin1234!' })
+      ).body.accessToken;
+    });
+
+    it('should return 200 and remove the SKU from the product', async () => {
+      logStep('DELETE', `/skus/${skuDelSkuId}`);
+      const res = await request(server)
+        .delete(`/skus/${skuDelSkuId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      logStep('DELETE', `/skus/${skuDelSkuId}`, res.status);
+
+      // @Delete with no @HttpCode → NestJS default 200.
+      expect(res.status).toBe(200);
+
+      // State check: SKU listing for this product no longer shows it.
+      const list = await request(server)
+        .get(`/products/${skuDelProdId}/skus`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(list.status).toBe(200);
+      expect(list.body.find((s: any) => s.id === skuDelSkuId)).toBeUndefined();
+    });
+
+    it('deleting an already-deleted SKU → 404', async () => {
+      logStep('DELETE', `/skus/${skuDelSkuId} (second time)`);
+      const res = await request(server)
+        .delete(`/skus/${skuDelSkuId}`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      logStep('DELETE', `/skus/${skuDelSkuId}`, res.status);
+      expect(res.status).toBe(404);
+    });
+
+    it('non-admin role → 403 and SKU is not removed', async () => {
+      // Provision a fresh SKU whose role-denial path we can check
+      // without breaking the happy-path SKU above.
+      const sku = await request(server)
+        .post(`/products/${skuDelProdId}/skus`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ skuCode: `${DEL_UNIQ}_SKU2`, priceCents: 999 });
+      expect(sku.status).toBe(201);
+
+      logStep('DELETE', `/skus/${sku.body.id} (auditor)`);
+      const res = await request(server)
+        .delete(`/skus/${sku.body.id}`)
+        .set('Authorization', `Bearer ${storeAdminToken}`);
+      logStep('DELETE', `/skus/${sku.body.id}`, res.status);
+      expect(res.status).toBe(403);
+
+      // State invariant — SKU still present.
+      const list = await request(server)
+        .get(`/products/${skuDelProdId}/skus`)
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(list.body.find((s: any) => s.id === sku.body.id)).toBeDefined();
+    });
+  });
 });
