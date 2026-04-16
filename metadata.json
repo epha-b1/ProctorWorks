@@ -1,6 +1,6 @@
 {
   "prompt": "A ProctorWorks Offline Operations Platform capable of running entirely on a single on-prem machine provides backend APIs for admins to manage a catalog-driven practice product business while also managing reservable study spaces as a physical resource.",
-  "project_type": "pure_backend",
+  "project_type": "server",
   "frontend_language": "none",
   "backend_language": "typescript",
   "frontend_framework": "none",
